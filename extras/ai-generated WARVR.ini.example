@@ -34,6 +34,9 @@
 ;   viewport and shader constants back at once (several D3D calls per object). on = only when something needs them,
 ;   and not at all when the game overwrites them anyway. Compare the PERF lines with it off and on; report odd visuals.
 ;lazy_state=off
+; auto_vr: on = switch VR on by itself once the character is in the world (same as pressing Ctrl+Shift+Numpad *).
+;   Meant for test runs and setups where the hotkey does not reach the game.
+;auto_vr=off
 ; desktop_every: while in VR the desktop window is NOT presented (saves the blit and, mainly, the wait for your
 ; monitor's vertical sync, which used to be added to the headset's own wait). 0 = never. N = show every Nth frame
 ; (you will feel a small hitch on those frames), e.g. 60.

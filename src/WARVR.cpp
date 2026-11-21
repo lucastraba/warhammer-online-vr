@@ -305,6 +305,8 @@ static double g_maxPixels = 0, g_renderScale = 1.0;   // 0 = no pixel budget: St
 static unsigned g_gpuSubmitErrStreak = 0;        // consecutive Submit() errors while the GPU hand-off was in use
 // DXVK hand-off (vkpath.h): used when DXVK's d3d9.dll is the D3D9 layer instead of dgVoodoo.
 static bool g_vkPathWanted = true;               // INI vk_path=auto|off
+static bool g_autoVr = false;                    // INI auto_vr=on: switch VR on once, at the first in-world frame (testing without hotkeys)
+static std::atomic<bool> g_autoVrRequest{false}; // set by Present, run by the worker thread like a hotkey
 static bool g_isDxvk = false;                    // the d3d9.dll the game uses is DXVK (decided in the Direct3DCreate9 hook)
 static vkp::Handoff g_vk;
 static bool g_vkActive = false;                  // the last frame went to SteamVR as a Vulkan image
@@ -1670,7 +1672,10 @@ static void RunProbes(IDirect3DDevice9* dev)
     }
 
     // Can this (plain D3D9) device create a shared render target? Needed for zero-copy hand-off to D3D11/OpenVR.
-    {
+    // Not under DXVK: the VK path needs no shared handle, and DXVK asks the Vulkan driver for Win32 external memory
+    // here; without it (Mesa under Wine) the texture comes back broken and the game crashed soon after.
+    if (g_isDxvk) Log("probe shared RT: skipped (DXVK, the VK path hands off without shared handles)\n");
+    else {
         HANDLE shared = nullptr;
         IDirect3DTexture9* tex = nullptr;
         HRESULT hr = dev->CreateTexture(1024, 1024, 1, D3DUSAGE_RENDERTARGET, D3DFMT_A8R8G8B8, D3DPOOL_DEFAULT, &tex, &shared);
@@ -2423,6 +2428,7 @@ static HRESULT WINAPI HookPresent(IDirect3DDevice9* self, const RECT* a, const R
     ++g_frame;
     g_reflHandled = false;                    // the reflection camera is re-steered every frame
     if (g_framePerspDraws > 500) ++g_worldFrames; else g_worldFrames = 0;
+    if (g_autoVr && g_worldFrames == 150) { g_autoVr = false; g_autoVrRequest = true; Log("AUTO VR: first in-world frames, switching VR on (auto_vr=on)\n"); }
     if (g_log && !g_autoWorldCaptured && g_worldFrames > 120 && !g_capturing) { g_autoWorldCaptured = true; g_captureRequest = true; Log("AUTO capture of the first in-world frame\n"); }
     if (g_captureCountdown > 0 && --g_captureCountdown == 0 && !g_capturing && g_log) { g_captureRequest = true; Log("AUTO capture after toggle\n"); }
     if (g_frameBestValid) { g_mainView = g_frameBestView; g_mainProj = g_frameBestProj; g_mainValid = true; }
@@ -2807,6 +2813,7 @@ static void LoadHotkeyConfig()
         if (_stricmp(line, "eye_size") == 0) { g_eyeSizeCfg = (UINT)atoi(val); Log("WARVR.ini: eye_size -> %u\n", g_eyeSizeCfg); continue; }
         if (_stricmp(line, "positional") == 0) { g_positional = atoi(val) != 0; Log("WARVR.ini: positional -> %d\n", g_positional ? 1 : 0); continue; }
         if (_stricmp(line, "gpu_path") == 0) { g_gpuPathWanted = _stricmp(val, "off") != 0; Log("WARVR.ini: gpu_path -> %s\n", g_gpuPathWanted ? "auto" : "off"); continue; }
+        if (_stricmp(line, "auto_vr") == 0) { g_autoVr = _stricmp(val, "on") == 0 || _stricmp(val, "1") == 0; Log("WARVR.ini: auto_vr -> %s\n", g_autoVr ? "on" : "off"); continue; }
         if (_stricmp(line, "lazy_state") == 0) { g_lazyState = _stricmp(val, "on") == 0 || _stricmp(val, "1") == 0; Log("WARVR.ini: lazy_state -> %s\n", g_lazyState ? "on (experimental)" : "off"); continue; }
         if (_stricmp(line, "vk_path") == 0) { g_vkPathWanted = _stricmp(val, "off") != 0; Log("WARVR.ini: vk_path -> %s\n", g_vkPathWanted ? "auto" : "off"); continue; }
         if (_stricmp(line, "desktop_every") == 0) { g_desktopEvery = (unsigned)atoi(val); Log("WARVR.ini: desktop_every -> %u\n", g_desktopEvery); continue; }
@@ -2985,6 +2992,7 @@ static DWORD WINAPI Worker(void*)
             if (a >= 0 && a < ACT_COUNT) RunAction(static_cast<Action>(a), "RegisterHotKey");
         }
         for (int a = 0; a < ACT_COUNT; ++a) if (PolledTrigger(static_cast<Action>(a))) RunAction(static_cast<Action>(a), "polled");
+        if (g_autoVrRequest.exchange(false)) RunAction(ACT_VR, "auto_vr");
 
         // Diagnostics: while Ctrl+Shift are held, log every other key Windows reports as down.
         bool chord = (GetAsyncKeyState(VK_CONTROL) & 0x8000) && (GetAsyncKeyState(VK_SHIFT) & 0x8000);
