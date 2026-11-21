@@ -1,0 +1,14 @@
+; Exports of the fake openvr_api.dll (cdecl, undecorated, same names as Valve's openvr_api.dll).
+LIBRARY openvr_api.dll
+EXPORTS
+    VR_InitInternal
+    VR_InitInternal2
+    VR_ShutdownInternal
+    VR_IsHmdPresent
+    VR_IsRuntimeInstalled
+    VR_GetRuntimePath
+    VR_GetGenericInterface
+    VR_IsInterfaceVersionValid
+    VR_GetInitToken
+    VR_GetVRInitErrorAsSymbol
+    VR_GetVRInitErrorAsEnglishDescription

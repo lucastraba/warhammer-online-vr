@@ -1,0 +1,61 @@
+; fakevr.ini - configuration for the fake OpenVR runtime (fakevr's openvr_api.dll).
+; Copy to fakevr.ini in the same folder as openvr_api.dll. Every key is optional; missing keys use the defaults below.
+; Format: key=value, one per line. ';' or '#' starts a comment. Keys are case-insensitive.
+; The file is re-read on every VR_InitInternal (and VR_IsHmdPresent), so you can edit it between VR on/off toggles.
+
+; ---- display -------------------------------------------------------------------------------------------------------
+; Refresh rate of the simulated headset. WaitGetPoses releases the app once per display slot (1/refresh_hz seconds).
+refresh_hz=90
+
+; Per-eye render target size returned by GetRecommendedRenderTargetSize.
+width=2016
+height=2240
+
+; Interpupillary distance in metres. GetEyeToHeadTransform puts the eyes at x = -ipd/2 (left) and +ipd/2 (right).
+ipd=0.063
+
+; Field of view preset (tangents of the half-angles, as GetProjectionRaw returns them):
+;   index  : Valve Index-like, left eye l=-1.39 r=1.24 t=-1.47 b=1.46, right eye mirrored in x (default)
+;   narrow : synthetic 90 x 90 degrees, +-1.0 on every side
+;   wide   : synthetic wide headset, left eye l=-1.80 r=1.50 t=-1.50 b=1.50, right eye mirrored
+; OpenVR convention: "top" is the NEGATIVE tangent and "bottom" the positive one. fakevr keeps that.
+fov=index
+
+; Or set the 4 tangents per eye yourself (overrides the preset; any subset works):
+;left_l=-1.39
+;left_r=1.24
+;left_t=-1.47
+;left_b=1.46
+;right_l=-1.24
+;right_r=1.39
+;right_t=-1.47
+;right_b=1.46
+
+; Canted displays: rotate each eye outward about the vertical axis by this many degrees in GetEyeToHeadTransform
+; (some wide-FOV headsets do this). 0 = parallel eyes, identity rotation (default).
+cant_deg=0
+
+; ---- head pose -----------------------------------------------------------------------------------------------------
+; static : HMD at the origin looking straight ahead (identity, y = 0)
+; sweep  : slow yaw sine (amplitude sweep_deg, period sweep_period_s) plus a small positional bob (bob_m metres),
+;          so the game's camera and culling get exercised the way a real head would move them.
+pose=static
+sweep_deg=30
+sweep_period_s=8
+bob_m=0.02
+
+; ---- capture -------------------------------------------------------------------------------------------------------
+; Every dump_every-th frame, write what each eye submitted (only the bounds region) as a 24-bit BMP next to the DLL:
+; fakevr_dump_<frame>_L.bmp / _R.bmp. D3D11 textures in BGRA8 or RGBA8 only. 0 = off (default).
+; Dumping stalls the app's GPU for that frame (copy + Map), so frames with a dump are not representative for timing.
+dump_every=0
+
+; ---- testing -------------------------------------------------------------------------------------------------------
+; fail_init=1 makes VR_InitInternal fail (and VR_IsHmdPresent return false) with error fail_init_error
+; (default 108 = VRInitError_Init_HmdNotFound), to test the app's "no headset" path.
+fail_init=0
+;fail_init_error=108
+
+; ---- log -----------------------------------------------------------------------------------------------------------
+; on : write fakevr.log next to the DLL (default)   off : no log file at all
+log=on
