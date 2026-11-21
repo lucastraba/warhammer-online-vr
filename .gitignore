@@ -1,0 +1,4 @@
+build/
+build-cross/
+*.user
+.vs/
