@@ -9,6 +9,7 @@
 //        View' = View * Q4          (row-vector: applied after View, rotates about the eye)
 // where Q is the head rotation relative to a yaw-only reference, converted RH->LH.
 #pragma once
+#include <algorithm>
 #include <cmath>
 #include <cstdint>
 #include <initializer_list>
