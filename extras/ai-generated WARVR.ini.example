@@ -26,6 +26,10 @@
 ; gpu_path: send each eye to SteamVR with a pure GPU copy instead of reading the picture back through the CPU.
 ;   auto = try it, fall back to the CPU path by itself if it cannot work.   off = always use the CPU path.
 ;gpu_path=auto
+; vk_path: only matters with DXVK's d3d9.dll in the game folder INSTEAD of dgVoodoo (experimental, see docs/DXVK.md).
+;   The eye pictures then go to SteamVR as Vulkan images, no copy at all. Start SteamVR BEFORE the game.
+;   auto = use it when DXVK is detected, fall back to the CPU path by itself.   off = never.
+;vk_path=auto
 ; desktop_every: while in VR the desktop window is NOT presented (saves the blit and, mainly, the wait for your
 ; monitor's vertical sync, which used to be added to the headset's own wait). 0 = never. N = show every Nth frame
 ; (you will feel a small hitch on those frames), e.g. 60.

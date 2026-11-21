@@ -132,6 +132,15 @@ public:
         VRTextureBounds_t b = { 0.f, 0.f, 1.f, 1.f };
         return comp_->Submit(eye ? EVREye_Eye_Right : EVREye_Eye_Left, &t, &b, EVRSubmitFlags_Submit_Default);
     }
+    // DXVK hand-off: one Vulkan image holding both eyes side by side; each eye is submitted with its half as the bounds.
+    EVRCompositorError SubmitVulkan(int eye, VRVulkanTextureData_t* data, float u0, float u1)
+    {
+        Texture_t t; t.handle = data; t.eType = ETextureType_TextureType_Vulkan; t.eColorSpace = EColorSpace_ColorSpace_Gamma;
+        VRTextureBounds_t b = { u0, 0.f, u1, 1.f };
+        return comp_->Submit(eye ? EVREye_Eye_Right : EVREye_Eye_Left, &t, &b, EVRSubmitFlags_Submit_Default);
+    }
+    // Vulkan submitters: with "application performs PostPresentHandoff", WaitGetPoses stops touching the app's queue.
+    void SetExplicitTiming(EVRCompositorTimingMode m) { if (comp_ && comp_->SetExplicitTimingMode) comp_->SetExplicitTimingMode(m); }
     void PostPresentHandoff() { if (comp_) comp_->PostPresentHandoff(); }
 
     void Shutdown()

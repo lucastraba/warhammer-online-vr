@@ -51,6 +51,7 @@
 #include "openvr_head.h"
 #include "vrdisplay.h"
 #include "gpupath.h"
+#include "vkpath.h"
 #if defined(__GNUC__)
 #pragma GCC target("sse2")
 #endif
@@ -302,6 +303,13 @@ static HWND g_gameHwnd = nullptr;
 static int g_resMode = 2;                        // INI vr_resolution: 0 = desktop, 1 = steamvr (always), 2 = auto (steamvr when the GPU hand-off is available)
 static double g_maxPixels = 0, g_renderScale = 1.0;   // 0 = no pixel budget: SteamVR's exact size, only clamped to what the D3D9 device allows
 static unsigned g_gpuSubmitErrStreak = 0;        // consecutive Submit() errors while the GPU hand-off was in use
+// DXVK hand-off (vkpath.h): used when DXVK's d3d9.dll is the D3D9 layer instead of dgVoodoo.
+static bool g_vkPathWanted = true;               // INI vk_path=auto|off
+static bool g_isDxvk = false;                    // the d3d9.dll the game uses is DXVK (decided in the Direct3DCreate9 hook)
+static vkp::Handoff g_vk;
+static bool g_vkActive = false;                  // the last frame went to SteamVR as a Vulkan image
+static unsigned g_vkFrames = 0, g_vkFails = 0, g_vkSubmitErrStreak = 0;
+static const char* g_vkWhy = "";
 static bool g_redirect = false;                  // the game's main render target is replaced by our own VR-sized one
 static IDirect3DSurface9 *g_vrRT = nullptr, *g_vrDS = nullptr, *g_bbSurf = nullptr, *g_autoDS = nullptr;
 static UINT g_logW = 0, g_logH = 0;              // the size the GAME believes its screen is
@@ -1733,7 +1741,16 @@ static bool VRRedirectBegin(IDirect3DDevice9* dev, UINT w, UINT h)
     IDirect3DSurface9* ds = nullptr;
     g_autoDS = nullptr;
     if (SUCCEEDED(dev->GetDepthStencilSurface(&ds)) && ds) { D3DSURFACE_DESC dd{}; ds->GetDesc(&dd); dsFmt = dd.Format; g_autoDS = ds; ds->Release(); }
-    HRESULT hr = dev->CreateRenderTarget(w, h, D3DFMT_A8R8G8B8, D3DMULTISAMPLE_NONE, 0, FALSE, &g_vrRT, nullptr);
+    HRESULT hr = E_FAIL;
+    if (g_vk.Attached()) {
+        // DXVK: make the target level 0 of a render-target TEXTURE. Plain render-target surfaces get no SAMPLED usage in
+        // DXVK, and SteamVR needs it, so this lets the Vulkan hand-off submit our target directly with no copy.
+        IDirect3DTexture9* t = nullptr;
+        hr = dev->CreateTexture(w, h, 1, D3DUSAGE_RENDERTARGET, D3DFMT_A8R8G8B8, D3DPOOL_DEFAULT, &t, nullptr);
+        if (SUCCEEDED(hr) && t) { hr = t->GetSurfaceLevel(0, &g_vrRT); t->Release(); }      // the surface keeps its texture alive
+        if (FAILED(hr)) g_vrRT = nullptr;
+    }
+    if (!g_vrRT) hr = dev->CreateRenderTarget(w, h, D3DFMT_A8R8G8B8, D3DMULTISAMPLE_NONE, 0, FALSE, &g_vrRT, nullptr);
     if (FAILED(hr)) { if (!g_redirectQuiet) Log("VR redirect: CreateRenderTarget(%ux%u) failed hr=0x%08lX (%s)\n", w, h, (unsigned long)hr, hr == D3DERR_OUTOFVIDEOMEMORY ? "D3DERR_OUTOFVIDEOMEMORY" : "?"); g_vrRT = nullptr; return false; }
     hr = dev->CreateDepthStencilSurface(w, h, dsFmt, D3DMULTISAMPLE_NONE, 0, FALSE, &g_vrDS, nullptr);
     if (FAILED(hr)) { if (!g_redirectQuiet) Log("VR redirect: CreateDepthStencilSurface(%ux%u fmt %d) failed hr=0x%08lX\n", w, h, (int)dsFmt, (unsigned long)hr); g_vrRT->Release(); g_vrRT = nullptr; g_vrDS = nullptr; return false; }
@@ -2015,6 +2032,51 @@ static void VRPrepareMainTarget(IDirect3DDevice9* dev)
     g_origSetViewport(dev, &g_devVP);
 }
 
+// DXVK hand-off: submit this frame's side-by-side picture to SteamVR as one Vulkan image (left/right half via bounds).
+// Same sequence as Proton's vrclient for D3D11-on-DXVK games. Returns false (and the caller falls back) if it cannot.
+static bool VRSubmitVulkan(IDirect3DDevice9* dev, EVRCompositorError* e0, EVRCompositorError* e1)
+{
+    VRPrepareMainTarget(dev);                 // alpha = 1 over the picture, and the main target bound
+    IDirect3DSurface9* src = nullptr; bool own = false;
+    if (g_redirect && g_vrRT) src = g_vrRT;
+    else { if (FAILED(dev->GetBackBuffer(0, 0, D3DBACKBUFFER_TYPE_MONO, &src)) || !src) { g_vkWhy = "GetBackBuffer failed"; return false; } own = true; }
+    vkp::Frame f; const char* why = "";
+    bool ok = g_vk.Describe(src, &f, &why);
+    if (!ok) {                                // e.g. the real back buffer, or a plain render target: copy into our own texture
+        IDirect3DSurface9* c = g_vk.CopyIfNeeded(dev, src, g_origStretchRect, Log);
+        ok = c && g_vk.Describe(c, &f, &why);
+        if (!c) why = "copy into an own texture failed";
+    }
+    if (own) src->Release();
+    if (!ok) { g_vkWhy = why; return false; }
+    if (!g_vk.explicitTimingSet) {
+        g_vr.SetExplicitTiming(EVRCompositorTimingMode_VRCompositorTimingMode_Explicit_ApplicationPerformsPostPresentHandoff);
+        g_vk.explicitTimingSet = true;
+        Log("VK path: explicit timing mode set (WaitGetPoses no longer uses DXVK's queue; PostPresentHandoff runs under the queue lock)\n");
+    }
+    const vkp::VkImageSubresourceRange range = { vkp::ASPECT_COLOR, 0, f.mips, 0, f.layers };
+    g_vk.dev->TransitionTextureLayout(f.tex, &range, f.layout, vkp::LAYOUT_TRANSFER_SRC_OPTIMAL);
+    g_vk.dev->FlushRenderingCommands();
+    g_vk.dev->LockSubmissionQueue();          // no D3D9 calls from here until ReleaseSubmissionQueue
+    VRVulkanTextureData_t vd{};
+    vd.m_nImage = f.image;
+    vd.m_pDevice = reinterpret_cast<struct VkDevice_T*>(g_vk.device);
+    vd.m_pPhysicalDevice = reinterpret_cast<struct VkPhysicalDevice_T*>(g_vk.phys);
+    vd.m_pInstance = reinterpret_cast<struct VkInstance_T*>(g_vk.inst);
+    vd.m_pQueue = reinterpret_cast<struct VkQueue_T*>(g_vk.queue);
+    vd.m_nQueueFamilyIndex = g_vk.queueFamily;
+    vd.m_nWidth = f.width; vd.m_nHeight = f.height; vd.m_nFormat = f.format; vd.m_nSampleCount = f.samples;
+    *e0 = g_vr.SubmitVulkan(0, &vd, 0.f, 0.5f);
+    *e1 = g_vr.SubmitVulkan(1, &vd, 0.5f, 1.f);
+    g_vk.dev->ReleaseSubmissionQueue();
+    g_vk.dev->TransitionTextureLayout(f.tex, &range, vkp::LAYOUT_TRANSFER_SRC_OPTIMAL, f.layout);
+    if (!g_vkActive || g_vkFrames == 0)
+        Log("VK path: ACTIVE - submitting VkImage 0x%llx %ux%u (VkFormat %u, layout %d, usage 0x%x) straight to SteamVR, both eyes from one image\n",
+            (unsigned long long)f.image, f.width, f.height, f.format, (int)f.layout, f.usage);
+    ++g_vkFrames; g_vkActive = true;
+    return true;
+}
+
 static void VRStop(IDirect3DDevice9* dev, const char* why)
 {
     Log("VR stopping (%s)\n", why);
@@ -2024,6 +2086,7 @@ static void VRStop(IDirect3DDevice9* dev, const char* why)
     g_vrHaveEye[0] = g_vrHaveEye[1] = false;
     VRReleaseCapture();
     gpu::ReleaseEyes();
+    g_vk.ReleaseCopy(); g_vk.explicitTimingSet = false; g_vkActive = false;
     VRRedirectEnd(dev);
     g_vrDisplay.Shutdown();
     g_vr.Shutdown();
@@ -2052,7 +2115,8 @@ static bool VRStart(IDirect3DDevice9* dev)
     {
         // Is the GPU hand-off possible? Only then is a huge render target worth it: the CPU path squeezes every eye down to
         // eye_size (default 1600 high) before reading it back, so the extra pixels would be thrown away.
-        const bool gpuOk = g_gpuPathWanted && gpu::HaveGame();
+        const bool gpuOk = (g_gpuPathWanted && gpu::HaveGame()) || (g_vkPathWanted && g_vk.Attached());
+        if (g_vkPathWanted && g_vk.Attached()) Log("VK path: DXVK is the D3D9 layer; eye pictures go to SteamVR as Vulkan images (no copy, no CPU readback)\n");
         const bool wantHiRes = g_resMode == 1 || (g_resMode == 2 && gpuOk);
         Log("VR: resolution mode=%s, GPU hand-off available=%d (%d D3D11 candidate(s)) -> %s\n", g_resMode == 1 ? "steamvr" : (g_resMode == 0 ? "desktop" : "auto"),
             gpuOk ? 1 : 0, gpu::CandidateCount(), wantHiRes ? "rendering at SteamVR's size" : "rendering at the game's own resolution");
@@ -2102,8 +2166,9 @@ static bool VRStart(IDirect3DDevice9* dev)
             Log("GPU path: hooks installed in the D3D11 context vtable %p (%s); waiting to learn the game's D3D11 context\n", (void*)vt, Describe(vt).c_str());
     }
     g_vrFrameNo = 0; g_gpuFrames = g_gpuFails = g_gpuFailStreak = 0; g_gpuActive = false;
+    g_vkActive = false; g_vkSubmitErrStreak = 0;
     if (!VRCreateCapture(dev)) {
-        if (g_gpuPathWanted && gpu::HaveGame())         // not needed while the GPU hand-off works; created lazily if the CPU path is ever used
+        if ((g_gpuPathWanted && gpu::HaveGame()) || (g_vkPathWanted && g_vk.Attached()))   // not needed while the GPU hand-off works; created lazily if the CPU path is ever used
             Log("VR: could not create the CPU-path capture surfaces (low video memory); continuing, the GPU path does not need them\n");
         else { g_vrDisplay.Shutdown(); VRRedirectEnd(dev); g_wantRTW = g_wantRTH = 0; g_vr.Shutdown(); return false; }
     }
@@ -2140,7 +2205,14 @@ static void VRBeforePresent(IDirect3DDevice9* dev)
     if (g_stereoSBS) {
         // Both eyes were drawn into the two halves of this frame's main render target.
         void* texL = nullptr; void* texR = nullptr;
-        if (g_gpuPathWanted && gpu::HaveGame()) {
+        bool vkDone = false;
+        EVRCompositorError e0 = EVRCompositorError_VRCompositorError_None, e1 = EVRCompositorError_VRCompositorError_None;
+        if (g_vkPathWanted && g_vk.Attached()) {
+            vkDone = VRSubmitVulkan(dev, &e0, &e1);
+            if (!vkDone) { ++g_vkFails; g_vkActive = false; if (g_vkFails <= 3) Log("VK path: not usable this frame (%s) -> fallback\n", g_vkWhy); }
+        }
+        if (vkDone) {
+        } else if (g_gpuPathWanted && gpu::HaveGame()) {
             // GPU path: copy each half on the GPU into textures on the game's own D3D11 device. No CPU involved.
             const int set = (int)(g_vrFrameNo & 1);
             VRPrepareMainTarget(dev);
@@ -2154,7 +2226,7 @@ static void VRBeforePresent(IDirect3DDevice9* dev)
                 if (g_gpuWhy != r.why || g_gpuFails <= 3) Log("GPU path: not usable this frame (%s; bound target %ux%u format %d, expected shape %ux%u) -> CPU fallback\n", r.why, r.srcW, r.srcH, (int)r.srcFmt, g_bbW, g_bbH);
                 g_gpuWhy = r.why;
             }
-        } else if (g_gpuPathWanted && g_vrFrameNo == 240) {
+        } else if (g_gpuPathWanted && g_vrFrameNo == 240 && !g_vk.Attached()) {
             {
                 Log("GPU path: no D3D11 device was ever handed to the game's translation layer (creation hook calls=%u captured=%u, vtable hook hits=%u, creation hooks installed=%d). Using the CPU path.\n",
                     gpu::g_s.createCalls, gpu::g_s.createCaptured, gpu::g_s.hits, gpu::g_s.createHooked ? 1 : 0);
@@ -2166,7 +2238,7 @@ static void VRBeforePresent(IDirect3DDevice9* dev)
                         "or dgVoodoo is not the D3D9 layer in use.\n");
             }
         }
-        if (!texL) {                                        // CPU path (always available as a fallback)
+        if (!texL && !vkDone) {                             // CPU path (always available as a fallback)
             IDirect3DSurface9* bb = nullptr; D3DSURFACE_DESC d{};
             if (g_redirect && g_vrRT) g_vrRT->GetDesc(&d);
             else {
@@ -2180,13 +2252,19 @@ static void VRBeforePresent(IDirect3DDevice9* dev)
             texL = g_vrDisplay.eyeTexture(0); texR = g_vrDisplay.eyeTexture(1);
         }
         g_vrCapMsSum += NowMs() - t0; ++g_vrFramesInPeriod;
-        EVRCompositorError e0 = g_vr.Submit(0, texL);
-        EVRCompositorError e1 = g_vr.Submit(1, texR);
+        if (!vkDone) { e0 = g_vr.Submit(0, texL); e1 = g_vr.Submit(1, texR); }
         if (e0 || e1) ++g_vrSubmitErr;
         if (g_vrPairs < 5 || e0 || e1) {
             static unsigned errLogs = 0;
-            if (g_vrPairs < 5 || errLogs++ < 20) Log("VR: submit pair %u (%s) -> left err=%d right err=%d\n", g_vrPairs, g_gpuActive ? "GPU" : "CPU", (int)e0, (int)e1);
+            if (g_vrPairs < 5 || errLogs++ < 20) Log("VR: submit pair %u (%s) -> left err=%d right err=%d\n", g_vrPairs, vkDone ? "VK" : (g_gpuActive ? "GPU" : "CPU"), (int)e0, (int)e1);
         }
+        if (vkDone && (e0 || e1)) {
+            if (++g_vkSubmitErrStreak >= 5) {           // SteamVR refuses the Vulkan images (e.g. missing extensions): use the CPU path
+                g_vkPathWanted = false; g_vkActive = false; g_vk.ReleaseCopy();
+                Log("VK path: SteamVR rejected the Vulkan eye images 5 times in a row (err=%d/%d) -> switching to the CPU path for this session. "
+                    "Usual cause: SteamVR was not running when the game started, so DXVK could not enable the Vulkan extensions SteamVR needs.\n", (int)e0, (int)e1);
+            }
+        } else if (vkDone) g_vkSubmitErrStreak = 0;
         if (g_gpuActive && (e0 || e1)) {
             if (++g_gpuSubmitErrStreak >= 5) {          // SteamVR refuses the game's textures: go back to the CPU path for good
                 g_gpuPathWanted = false; g_gpuActive = false; gpu::ReleaseEyes();
@@ -2220,7 +2298,9 @@ static void VRAfterPresent()
     if (!g_vrActive) return;
     if (g_vrEye == 0) {
         const int64_t tw = g_log ? PerfTick() : 0;
-        g_vr.PostPresentHandoff();
+        if (g_vkActive && g_vk.Attached()) {      // SteamVR uses DXVK's queue here
+            g_vk.dev->LockSubmissionQueue(); g_vr.PostPresentHandoff(); g_vk.dev->ReleaseSubmissionQueue();
+        } else g_vr.PostPresentHandoff();
         OpenVRHead::Pose pose;
         EVRCompositorError e = g_vr.WaitPoses(&pose);
         if (g_log) g_pf[PF_WAIT] += PerfTick() - tw;
@@ -2351,6 +2431,9 @@ static HRESULT WINAPI HookPresent(IDirect3DDevice9* self, const RECT* a, const R
             g_gpuPathWanted ? 1 : 0, g_gpuActive ? 1 : 0, g_gpuFrames, g_gpuFails, g_gpuWhy, gpu::CandidateCount(), gpu::g_s.createCalls, gpu::g_s.createCaptured, gpu::g_s.hits, g_desktopSkipped,
             g_redirect ? 1 : 0, g_bbW, g_bbH, g_logW, g_logH, g_cursorOn ? 1 : 0);
         g_gpuFrames = g_gpuFails = g_desktopSkipped = 0;
+        if (g_isDxvk) Log("   VK PATH (DXVK): wanted=%d attached=%d active=%d frames=%u fallbacks=%u (last reason: %s)\n",
+            g_vkPathWanted ? 1 : 0, g_vk.Attached() ? 1 : 0, g_vkActive ? 1 : 0, g_vkFrames, g_vkFails, g_vkWhy);
+        g_vkFrames = g_vkFails = 0;
         if (g_tSamples) {
             const double n = (double)g_tSamples;
             Log("   VR capture stages (avg ms per eye): stretch=%.2f getRenderTargetData=%.2f lock=%.2f convert=%.2f upload=%.2f\n",
@@ -2401,6 +2484,7 @@ static HRESULT WINAPI HookReset(IDirect3DDevice9* self, D3DPRESENT_PARAMETERS* p
     LogPresentParams("Reset", pp);
     RestoreCamera();
     VRReleaseCapture();                       // default-pool surfaces must not survive a Reset; recreated lazily
+    g_vk.ReleaseCopy();                       // default-pool texture: must be released before Reset
     gpu::ReleaseEyes();                       // dgVoodoo keeps its D3D11 device across a Reset (phase 7b wrongly forgot it); a NEW device would arrive through the creation hook
     VRRedirectEnd(self);
     g_vsActive = g_psActive = false; g_curFVF = 0; g_havePendingView = false; g_haveOrigView = g_haveOrigProj = false; g_rtIsMain = true; g_haveGameVP = false; g_rightVersion = ~0u;
@@ -2451,12 +2535,23 @@ static HRESULT WINAPI HookCreateDevice(IDirect3D9* self, UINT adapter, D3DDEVTYP
     Log("CreateDevice adapter=%u type=%d behaviorFlags=0x%lX\n", adapter, (int)type, (unsigned long)flags);
     HRESULT hr = g_origCreateDevice(self, adapter, type, wnd, flags, pp, out);
     Log("CreateDevice hr=0x%08lX dev=%p\n", (unsigned long)hr, out ? (void*)*out : nullptr);
-    if (SUCCEEDED(hr) && out && *out) { PatchDevice(*out); InstallCameraHook(); }
+    if (SUCCEEDED(hr) && out && *out) {
+        PatchDevice(*out); InstallCameraHook();
+        if (g_isDxvk && g_vkPathWanted && !g_vk.Attach(*out, Log)) Log("VK path: DXVK detected but the device has no interop interface -> CPU path\n");
+    }
     return hr;
 }
 
 static IDirect3D9* WINAPI HookDirect3DCreate9(UINT sdk)
 {
+    {
+        char path[MAX_PATH] = {};
+        g_isDxvk = vkp::ModuleLooksLikeDxvk(reinterpret_cast<const void*>(g_origCreate9), path, sizeof(path));
+        Log("D3D9 layer: %s -> %s\n", path[0] ? path : "?", g_isDxvk ? "DXVK" : "not DXVK (dgVoodoo or Windows)");
+        // DXVK asks SteamVR for the Vulkan extensions it needs while creating its instance, i.e. inside this call,
+        // and only if openvr_api.dll is already loaded. So load it now.
+        if (g_isDxvk && g_vkPathWanted) vkp::PreloadOpenVR(ModuleDir().c_str(), Log);
+    }
     IDirect3D9* obj = g_origCreate9(sdk);
     Log("Direct3DCreate9(%u) -> %p\n", sdk, (void*)obj);
     if (!obj) return obj;
@@ -2657,6 +2752,7 @@ static void LoadHotkeyConfig()
         if (_stricmp(line, "eye_size") == 0) { g_eyeSizeCfg = (UINT)atoi(val); Log("WARVR.ini: eye_size -> %u\n", g_eyeSizeCfg); continue; }
         if (_stricmp(line, "positional") == 0) { g_positional = atoi(val) != 0; Log("WARVR.ini: positional -> %d\n", g_positional ? 1 : 0); continue; }
         if (_stricmp(line, "gpu_path") == 0) { g_gpuPathWanted = _stricmp(val, "off") != 0; Log("WARVR.ini: gpu_path -> %s\n", g_gpuPathWanted ? "auto" : "off"); continue; }
+        if (_stricmp(line, "vk_path") == 0) { g_vkPathWanted = _stricmp(val, "off") != 0; Log("WARVR.ini: vk_path -> %s\n", g_vkPathWanted ? "auto" : "off"); continue; }
         if (_stricmp(line, "desktop_every") == 0) { g_desktopEvery = (unsigned)atoi(val); Log("WARVR.ini: desktop_every -> %u\n", g_desktopEvery); continue; }
         if (_stricmp(line, "draw_distance") == 0) { float v = (float)atof(val); if (v >= 1.0f && v <= 16.f) g_drawDistScale = v; Log("WARVR.ini: draw_distance -> x%.2f (far plane multiplier)\n", g_drawDistScale); continue; }
         if (_stricmp(line, "pitch_lock_start") == 0) { g_pitchLock = (_stricmp(val, "on") == 0 || _stricmp(val, "true") == 0 || _stricmp(val, "1") == 0); Log("WARVR.ini: pitch_lock_start -> %s\n", g_pitchLock.load() ? "on" : "off"); continue; }
