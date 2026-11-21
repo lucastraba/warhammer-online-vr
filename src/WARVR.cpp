@@ -481,6 +481,40 @@ static void OnDraw(IDirect3DDevice9* self, const char* kind, UINT prims)
             (unsigned long)g_rsShadow[D3DRS_CLIPPLANEENABLE]);
 }
 
+// ---- lazy state restore (INI lazy_state=on, experimental) ---------------------------------------------------
+// After the right-eye copy of a world draw the device still has the right eye's viewport and constant patches. Restoring
+// them at once costs 1 + (number of patches) D3D calls per world draw, every one of which goes through the translation layer
+// on the game thread. With lazy_state=on they are restored only when something actually needs the game's values: the next
+// draw, a Clear, the frame's end. Patched registers the game uploads again in the meantime need no restore at all.
+// The game's own values are always in the shadow registers (g_regs / g_pregs), so a restore is just a re-upload from there.
+static bool g_lazyState = false;
+static bool g_vpDirty = false;                   // device viewport is an eye viewport, not g_devVP
+struct LazyPatch { int16_t reg, count; bool ps; };
+static LazyPatch g_lazyPending[32];
+static int g_lazyN = 0;
+static unsigned g_lazySavedCalls = 0, g_lazyFlushedCalls = 0;
+static void LazyCovered(bool ps, UINT start, UINT count)         // the game re-uploaded [start, start+count): those patches are gone
+{
+    for (int i = 0; i < g_lazyN; ) {
+        const LazyPatch& p = g_lazyPending[i];
+        if (p.ps == ps && (UINT)p.reg >= start && (UINT)(p.reg + p.count) <= start + count) { g_lazyPending[i] = g_lazyPending[--g_lazyN]; ++g_lazySavedCalls; }
+        else ++i;
+    }
+}
+static void LazyFlushConsts(IDirect3DDevice9* dev)
+{
+    for (int i = 0; i < g_lazyN; ++i) {
+        const LazyPatch& p = g_lazyPending[i];
+        if (p.ps) g_origSetPSConstF(dev, (UINT)p.reg, g_pregs[p.reg], (UINT)p.count);
+        else      g_origSetVSConstF(dev, (UINT)p.reg, g_regs[p.reg], (UINT)p.count);
+    }
+    g_lazyFlushedCalls += (unsigned)g_lazyN;
+    g_lazyN = 0;
+}
+static void LazyFlushVP(IDirect3DDevice9* dev) { if (g_vpDirty) { g_origSetViewport(dev, &g_devVP); g_vpDirty = false; ++g_lazyFlushedCalls; } }
+static void LazyFlush(IDirect3DDevice9* dev) { LazyFlushConsts(dev); LazyFlushVP(dev); }
+static void LazyForget() { g_lazyN = 0; g_vpDirty = false; }
+
 // ---- stereo draw duplication -----------------------------------------------------------------------------
 static void SetVP(IDirect3DDevice9* dev, int x, int y, int w, int h)
 {
@@ -691,6 +725,10 @@ template <class F>
 static HRESULT StereoDrawImpl(IDirect3DDevice9* dev, F&& issue)
 {
     const int kind = ClassifyDraw();
+    if (g_lazyN || g_vpDirty) {                                // lazy_state: the left-eye copy and every other draw need the game's constants;
+        LazyFlushConsts(dev);                                  // a world draw sets its own viewport right away, everything else needs the game's
+        if (kind != 1) LazyFlushVP(dev);
+    }
     if (kind == 0) return issue();
     if (!g_haveGameVP) { if (FAILED(dev->GetViewport(&g_gameVP))) return issue(); g_haveGameVP = true; g_devVP = g_gameVP; }
     const int rtW = (int)(g_curRTw ? g_curRTw : g_bbW), rtH = (int)(g_curRTh ? g_curRTh : g_bbH);
@@ -796,8 +834,14 @@ static HRESULT StereoDrawImpl(IDirect3DDevice9* dev, F&& issue)
                     if (nv > 1 || npx > 0) ++g_extraPatchDraws;
                     EyeRegion(1, rtW, rtH, &x, &y, &w, &h); SetVP(dev, x, y, w, h);
                     issue();
-                    for (int i = npx - 1; i >= 0; --i) g_origSetPSConstF(dev, (UINT)pp[i].reg, savedP[i], (UINT)pp[i].count);
-                    for (int i = nv - 1; i >= 0; --i) g_origSetVSConstF(dev, (UINT)pv[i].reg, savedV[i], (UINT)pv[i].count);
+                    if (g_lazyState && g_lazyN + nv + npx <= (int)(sizeof(g_lazyPending) / sizeof(g_lazyPending[0]))) {
+                        // leave the right eye's values in place; restored from the shadow registers when needed (see LazyFlush)
+                        for (int i = 0; i < npx; ++i) g_lazyPending[g_lazyN++] = { (int16_t)pp[i].reg, (int16_t)pp[i].count, true };
+                        for (int i = 0; i < nv; ++i)  g_lazyPending[g_lazyN++] = { (int16_t)pv[i].reg, (int16_t)pv[i].count, false };
+                    } else {
+                        for (int i = npx - 1; i >= 0; --i) g_origSetPSConstF(dev, (UINT)pp[i].reg, savedP[i], (UINT)pp[i].count);
+                        for (int i = nv - 1; i >= 0; --i) g_origSetVSConstF(dev, (UINT)pv[i].reg, savedV[i], (UINT)pv[i].count);
+                    }
                     ++g_dupWorld;
                     if (g_capturing && g_stereoCapLogged < 3000) {
                         ++g_stereoCapLogged;
@@ -828,7 +872,8 @@ static HRESULT StereoDrawImpl(IDirect3DDevice9* dev, F&& issue)
                 ++g_dupWorldFFP;
             }
         } else ++g_dupUnmatched;
-        g_origSetViewport(dev, &g_devVP);
+        if (g_lazyState) g_vpDirty = true;                     // restored by the next draw that needs it
+        else g_origSetViewport(dev, &g_devVP);
         return hr;
     }
 
@@ -964,6 +1009,7 @@ static HRESULT WINAPI HookSetVSConstF(IDirect3DDevice9* s, UINT start, const flo
     if (g_capturing && data && count)
         Cap("VS_CONST start=c%u count=%u  first=[%.5g %.5g %.5g %.5g]%s", start, count, data[0], data[1], data[2], data[3], tag);
     if (send && count && start + count <= 256) { memcpy(g_regs[start], send, count * 4 * sizeof(float)); g_vsScan.touch((int)start, (int)count); }
+    if (g_lazyN) LazyCovered(false, start, count);
     g_lastUpStart = start; g_lastUpCount = count;
     PF_SAMPLE_BEGIN(pfs);
     const HRESULT pfr = g_origSetVSConstF(s, start, send, count);
@@ -975,6 +1021,7 @@ static HRESULT WINAPI HookSetVSConstF(IDirect3DDevice9* s, UINT start, const flo
 static HRESULT WINAPI HookSetPSConstF(IDirect3DDevice9* s, UINT start, const float* data, UINT count)
 {
     if (data && count && start + count <= 256) { memcpy(g_pregs[start], data, count * 4 * sizeof(float)); g_psScan.touch((int)start, (int)count); }
+    if (g_lazyN) LazyCovered(true, start, count);
     if (g_capturing && data && count) Cap("PS_CONST start=c%u count=%u  first=[%.5g %.5g %.5g %.5g]", start, count, data[0], data[1], data[2], data[3]);
     PF_SAMPLE_BEGIN(pfs);
     const HRESULT pfr = g_origSetPSConstF(s, start, data, count);
@@ -1071,6 +1118,7 @@ static HRESULT WINAPI HookSetRenderTarget(IDirect3DDevice9* s, DWORD idx, IDirec
     }
     if (idx == 0 && g_hudBound) VRHudGameTookOver(s);
     if (idx == 0 && use && !g_rtIsMain) g_lastOffscreenRT = use;
+    if (idx == 0) g_vpDirty = false;                                         // D3D9 resets the viewport to the whole new target anyway
     HRESULT hr = g_origSetRenderTarget(s, idx, use);
     if (g_redirect && idx == 0 && use == g_vrRT && g_origSetDS) g_origSetDS(s, g_vrDS);   // our (large) depth buffer goes with it
     if (idx == 0 && g_redirect) ApplyColorWriteMask(s);
@@ -1113,12 +1161,14 @@ static HRESULT WINAPI HookSetViewport(IDirect3DDevice9* s, const D3DVIEWPORT9* v
         use = &scaled;
     }
     if (use) g_devVP = *use;
+    g_vpDirty = false;
     return g_origSetViewport(s, use);
 }
 
 static HRESULT WINAPI HookClear(IDirect3DDevice9* s, DWORD c, const D3DRECT* r, DWORD f, D3DCOLOR col, float z, DWORD st)
 {
     ++g_stats.clears;
+    LazyFlushVP(s);                                                            // Clear without rects clears the viewport
     if (g_redirect && g_rtIsMain && (f & D3DCLEAR_TARGET)) col |= 0xFF000000u;       // X8 semantics: alpha is always 1
     Cap("CLEAR rects=%lu flags=0x%lX color=0x%08lX z=%.3f", (unsigned long)c, (unsigned long)f, (unsigned long)col, z);
     if (g_redirect && g_rtIsMain && c && r && c <= 16 && g_logW && g_logH) {
@@ -2368,6 +2418,7 @@ static HRESULT WINAPI HookPresent(IDirect3DDevice9* self, const RECT* a, const R
 {
     { static bool once = false; if (!once) { once = true; Log("THREAD: first Present on thread %lu\n", GetCurrentThreadId()); } }
     if (g_log) { static int64_t last = 0; const int64_t now = PerfTick(); if (g_vrActive && last) { g_pf[PF_FRAME] += now - last; ++g_pfFrames; } last = now; }
+    LazyFlush(self);                            // our own drawing below, and the next frame, start from the game's state
     RestoreCamera();                            // give the game its own camera back before it updates it again
     ++g_frame;
     g_reflHandled = false;                    // the reflection camera is re-steered every frame
@@ -2412,6 +2463,9 @@ static HRESULT WINAPI HookPresent(IDirect3DDevice9* self, const RECT* a, const R
                 g_pf[PF_STEREO] * k, g_pf[PF_ISSUE] * k, g_pf[PF_SCAN] * k, (g_pf[PF_STEREO] - g_pf[PF_ISSUE] - g_pf[PF_SCAN]) * k, g_pf[PF_BEFORE] * k);
             Log("   PERF state calls: %.0f per frame (SetTexture, SetRenderState, vertex/pixel constants), about %.2f ms per frame inside dgVoodoo | shaders analysed VS=%u (refused %u) PS=%u (refused %u) | patches skipped as unused: %.0f per frame\n",
                 (double)g_stateCallsTotal / g_pfFrames, g_pf[PF_STATE] * k, g_shaderAnalysed[0], g_shaderRefused[0], g_shaderAnalysed[1], g_shaderRefused[1], (double)g_patchesSkipped / g_pfFrames);
+            if (g_lazyState) Log("   PERF lazy_state: restore calls avoided %.1f per frame (the game re-uploaded them), deferred restores done %.1f per frame\n",
+                (double)g_lazySavedCalls / g_pfFrames, (double)g_lazyFlushedCalls / g_pfFrames);
+            g_lazySavedCalls = g_lazyFlushedCalls = 0;
             g_stateCallsTotal = 0; g_patchesSkipped = 0;
             memset(g_pf, 0, sizeof(g_pf)); g_pfFrames = 0; gpu::g_s.waitTicks = 0;
         }
@@ -2484,6 +2538,7 @@ static HRESULT WINAPI HookReset(IDirect3DDevice9* self, D3DPRESENT_PARAMETERS* p
     LogPresentParams("Reset", pp);
     RestoreCamera();
     VRReleaseCapture();                       // default-pool surfaces must not survive a Reset; recreated lazily
+    LazyForget();
     g_vk.ReleaseCopy();                       // default-pool texture: must be released before Reset
     gpu::ReleaseEyes();                       // dgVoodoo keeps its D3D11 device across a Reset (phase 7b wrongly forgot it); a NEW device would arrive through the creation hook
     VRRedirectEnd(self);
@@ -2752,6 +2807,7 @@ static void LoadHotkeyConfig()
         if (_stricmp(line, "eye_size") == 0) { g_eyeSizeCfg = (UINT)atoi(val); Log("WARVR.ini: eye_size -> %u\n", g_eyeSizeCfg); continue; }
         if (_stricmp(line, "positional") == 0) { g_positional = atoi(val) != 0; Log("WARVR.ini: positional -> %d\n", g_positional ? 1 : 0); continue; }
         if (_stricmp(line, "gpu_path") == 0) { g_gpuPathWanted = _stricmp(val, "off") != 0; Log("WARVR.ini: gpu_path -> %s\n", g_gpuPathWanted ? "auto" : "off"); continue; }
+        if (_stricmp(line, "lazy_state") == 0) { g_lazyState = _stricmp(val, "on") == 0 || _stricmp(val, "1") == 0; Log("WARVR.ini: lazy_state -> %s\n", g_lazyState ? "on (experimental)" : "off"); continue; }
         if (_stricmp(line, "vk_path") == 0) { g_vkPathWanted = _stricmp(val, "off") != 0; Log("WARVR.ini: vk_path -> %s\n", g_vkPathWanted ? "auto" : "off"); continue; }
         if (_stricmp(line, "desktop_every") == 0) { g_desktopEvery = (unsigned)atoi(val); Log("WARVR.ini: desktop_every -> %u\n", g_desktopEvery); continue; }
         if (_stricmp(line, "draw_distance") == 0) { float v = (float)atof(val); if (v >= 1.0f && v <= 16.f) g_drawDistScale = v; Log("WARVR.ini: draw_distance -> x%.2f (far plane multiplier)\n", g_drawDistScale); continue; }
