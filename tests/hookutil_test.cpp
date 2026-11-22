@@ -14,12 +14,26 @@ int main()
       CHECK(hk::PrologueLength(p, &rel) == 9); }
     { const unsigned char p[] = { 0xE9,0x10,0x00,0x00,0x00,0x90 };              // foreign jmp rel32
       CHECK(hk::PrologueLength(p, &rel) == 5 && rel == 1); }
-    { const unsigned char p[] = { 0x55,0x8B,0x45,0x08,0x5D };                   // mov eax,[ebp+8] (memory form) -> unsupported
-      CHECK(hk::PrologueLength(p, &rel) == 0); }
+    { const unsigned char p[] = { 0x55,0x8B,0x45,0x08,0x5D };                   // push ebp; mov eax,[ebp+8]; pop ebp
+      CHECK(hk::PrologueLength(p, &rel) == 5); }
+    { const unsigned char p[] = { 0x83,0xEC,0x20,0x8B,0x44,0x24,0x48,0x8B };    // DXVK d3d11: sub esp,32; mov eax,[esp+48h]
+      CHECK(hk::PrologueLength(p, &rel) == 7 && rel == -1); }
+    { const unsigned char p[] = { 0x8B,0x0D,0x78,0x56,0x34,0x12 };              // mov ecx,[0x12345678]
+      CHECK(hk::PrologueLength(p, &rel) == 6); }
+    { const unsigned char p[] = { 0x8B,0x84,0x24,0x00,0x01,0x00,0x00 };         // mov eax,[esp+100h]
+      CHECK(hk::PrologueLength(p, &rel) == 7); }
+    { const unsigned char p[] = { 0xC7,0x45,0xFC,0x00,0x00,0x00,0x00 };         // mov dword [ebp-4],0
+      CHECK(hk::PrologueLength(p, &rel) == 7); }
+    { const unsigned char p[] = { 0x8B,0x04,0x8D,0x78,0x56,0x34,0x12 };         // mov eax,[ecx*4+0x12345678] (SIB, no base)
+      CHECK(hk::PrologueLength(p, &rel) == 7); }
     { const unsigned char p[] = { 0xEB,0x05,0x90,0x90,0x90,0x90 };              // short jmp -> unsupported
       CHECK(hk::PrologueLength(p, &rel) == 0); }
     { const unsigned char p[] = { 0xFF,0x25,0x78,0x56,0x34,0x12 };              // jmp [0x12345678]
       CHECK(hk::PrologueLength(p, &rel) == 6); }
+    { const unsigned char p[] = { 0xF3,0x0F,0x1E,0xFB,0x55,0x89,0xE5,0x83,0xEC,0x28 }; // Wine d3d11: endbr32; push ebp; mov ebp,esp
+      CHECK(hk::PrologueLength(p, &rel) == 5 && rel == -1); }
+    { const unsigned char p[] = { 0xF3,0x0F,0x1F,0xFB,0x55 };                   // F3 0F not followed by 1E FB -> unsupported
+      CHECK(hk::PrologueLength(p, &rel) == 0); }
     // trampoline for a plain prologue: copied bytes + jmp back
     { const unsigned char src[] = { 0x8B,0xFF,0x55,0x8B,0xEC,0xAA,0xBB };
       unsigned char t[16] = {};
