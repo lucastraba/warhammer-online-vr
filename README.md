@@ -1,6 +1,19 @@
 Experimental VR mod for Warhammer Online: Age of Reckoning
 by Ross Scott
 
+## About this fork
+This fork adds a build for people who don't compile, plus two experimental options aimed at the CPU bottleneck. They stay off unless you turn them on, so with your usual dgVoodoo setup the mod works as before.
+
+-Download: the latest release on the Releases page of this fork (WARVR.dll, WARVRInjector.exe, openvr_api.dll, an example WARVR.ini). The files in bin\ below are the original build.
+
+-lazy_state=on in WARVR.ini (with dgVoodoo): skips some of the extra work the mod does for every object.
+
+-DXVK instead of dgVoodoo: see docs\DXVK.md.
+
+-Tested only under Wine on Linux with a fake headset (tools\fakevr, tools\linux-rig), not yet on Windows or with a real headset. Like the original, written with Claude.
+
+-Problems or logs (%TEMP%\WARVR.log): open an issue on this fork.
+
 ## Description:
 This mod will activate full 3D VR rendering when inside Warhammer Online and should scale to any resolution.
 
