@@ -85,3 +85,13 @@ What broke on the way, all fixed in WARVR:
 - **dgVoodoo, GPU path never started**: the 5-byte hook on `D3D11CreateDevice` refused Wine's prologue
   (`endbr32`) and DXVK's (`sub esp,20h; mov eax,[esp+48h]`). The hook decoder now knows `endbr32` and
   ModRM memory operands, and has tests for both.
+
+## HUD styles (2026-11-22)
+
+`hud_style` flat / curved / low, checked with `vr_snapshot=40,3` + `vr_snapshot_hud_cycle=on` (one run, three
+pictures) and fakevr's fixed head turn (`head_yaw_deg`, `turn_after_submits=20`). Release build
+`warvr-fork-2026.11.22b` (commit f66dc52, CI/MSVC), head turned 25 degrees: all three styles complete in both eyes
+on DXVK and on dgVoodoo-over-DXVK, no submit errors. Head turned 35 degrees right: the minimap measures about
+133x167 px flat and 161x170 px curved. `hud_follow=lazy` with the head at 70 degrees: HUD centred in view.
+Readability and comfort in a real headset: not judged yet.
+
