@@ -42,6 +42,9 @@
 ; vr_snapshot: save the picture the headset receives once, after this many VR frames, as
 ;   %TEMP%\WARVR_vr_snapshot_<n>.bmp (half size, left half = left eye). 0 = off.
 ;vr_snapshot=0
+;   vr_snapshot=40,3 takes 3 of them, 40 frames apart. vr_snapshot_hud_cycle=on switches to the next HUD style after
+;   each one, so one run shows flat, curved and low.
+;vr_snapshot_hud_cycle=off
 ; desktop_every: while in VR the desktop window is NOT presented (saves the blit and, mainly, the wait for your
 ; monitor's vertical sync, which used to be added to the headset's own wait). 0 = never. N = show every Nth frame
 ; (you will feel a small hitch on those frames), e.g. 60.
@@ -82,6 +85,19 @@
 ;hud_distance=1.5
 ;hud_width=2.4
 ;hud_vertical=0.0
+; HUD shape (hud_anchor=world). Try these with the hotkey Ctrl+Shift+H, which cycles flat -> curved -> low while you play.
+; flat   (default) = the original flat panel.
+; curved           = the same size, bent around you like a cylinder: the edges face you and are as close as the middle,
+;                    so the minimap and chat in the corners are easier to read.
+; low              = curved, 0.35 m lower and leaned back 20 degrees: more of the world ahead is clear, the HUD is a glance down.
+;hud_style=flat
+; Fine-tuning (after hud_style; any of these makes the style "custom"):
+;hud_curve=off
+;hud_tilt=0                 (degrees; positive leans the top away from you)
+; Lazy follow: the panel stays put while you look around it; when you look more than hud_follow_deg away from its centre
+; (for example over your shoulder) it glides after you. off = the original behaviour.
+;hud_follow=off
+;hud_follow_deg=50
 
 ; ---------------------------------------------------------------- hotkeys (Ctrl+Shift + key). Defaults shown.
 ;vr=NUMPAD_MULTIPLY
@@ -98,3 +114,4 @@
 ;cursor=M
 ;hud_near=END
 ;hud_far=DELETE
+;hud_cycle=H

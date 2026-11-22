@@ -10,6 +10,10 @@ This fork adds a build for people who don't compile, plus two experimental optio
 
 -DXVK instead of dgVoodoo: see docs\DXVK.md.
 
+-HUD shape: Ctrl+Shift+H switches the HUD between flat (as before), curved (bent around you, so the minimap and chat at the edges face you) and low (curved, lower and leaned back, a glance down). hud_style=flat|curved|low in WARVR.ini picks the one it starts with.
+
+-draw_distance now also works without VR (flat screen).
+
 -Tested only under Wine on Linux with a fake headset (tools\fakevr, tools\linux-rig), not yet on Windows or with a real headset. Like the original, written with Claude.
 
 -Problems or logs (%TEMP%\WARVR.log): open an issue on this fork.

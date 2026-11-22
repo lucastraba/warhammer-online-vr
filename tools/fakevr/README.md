@@ -39,6 +39,8 @@ Every key and its default is in [`fakevr.ini.example`](fakevr.ini.example). The 
 | `fov` | `index` | `index`, `narrow`, `wide`, or set `left_l/left_r/left_t/left_b/right_*` directly |
 | `cant_deg` | 0 | rotate each eye outward (canted displays) |
 | `pose` | `static` | `static` (identity at y=0) or `sweep` (`sweep_deg`, `sweep_period_s`, `bob_m`) |
+| `head_yaw_deg`, `head_pitch_deg` | `0` | `pose=static` only: a fixed head turn (+yaw = right, +pitch = up), to look at what an off-centre head sees |
+| `turn_after_submits` | `0` | hold the head straight until this many submits were accepted, so the app's recenter at VR start sees the turn as a turn |
 | `dump_every` | 0 | write a BMP per eye every N frames (0 = off) |
 | `fail_init` | 0 | 1 = `VR_InitInternal` fails with `fail_init_error` (108 HmdNotFound) |
 | `log` | `on` | `off` = no log file |

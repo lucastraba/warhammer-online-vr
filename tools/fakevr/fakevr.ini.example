@@ -43,6 +43,12 @@ pose=static
 sweep_deg=30
 sweep_period_s=8
 bob_m=0.02
+; pose=static only: a fixed head turn, for looking at what a real head would see off-centre (HUD placement, culling).
+; +yaw = turned right, +pitch = looking up, degrees. turn_after_submits holds the head straight until that many submits
+; were accepted, so an app that recenters when VR starts (WARVR does) sees the turn as a turn.
+head_yaw_deg=0
+head_pitch_deg=0
+turn_after_submits=0
 
 ; ---- capture -------------------------------------------------------------------------------------------------------
 ; Every dump_every-th frame, write what each eye submitted (only the bounds region) as a 24-bit BMP next to the DLL:

@@ -253,6 +253,26 @@ static float g_prevPoseYaw = 0.f;
 static bool g_stereoSBS = true;
 static int g_hudMode = 0;                        // 0 = floating 3D rectangle, 1 = fill the whole eye view
 static float g_hudDistance = 1.5f, g_hudWidth = 2.4f, g_hudVert = 0.0f;   // metres
+// HUD panel shape (hud_anchor=world only). hud_style picks a preset; the single keys after it override it.
+//   flat   = the original flat rectangle (default)
+//   curved = the same size, bent around you so the edges face you and are as far away as the middle
+//   low    = curved, lowered and leaned back: the world ahead is clearer, the HUD is a glance down
+static int g_hudStyle = 0;                         // 0 flat, 1 curved, 2 low, 3 custom (single keys set)
+static bool g_hudCurve = false;
+static float g_hudTilt = 0.f;                      // degrees, top leans away
+static bool g_hudFollow = false;                   // lazy follow: the panel glides after your head when you look far away
+static float g_hudFollowDeg = 50.f;                // ...once your heading is this far from the panel centre
+static float g_hudYaw = 0.f;                       // current panel heading (radians, + = right), lazy follow only
+static bool g_hudFollowing = false;
+static float g_hudVertUser = 0.0f;                 // hud_vertical as set in WARVR.ini; "low" sits 0.35 m below it
+static const char* HudStyleName(int s) { return s == 0 ? "flat" : s == 1 ? "curved" : s == 2 ? "low" : "custom"; }
+static void ApplyHudStyle(int st)
+{
+    g_hudStyle = st;
+    if (st == 0) { g_hudCurve = false; g_hudTilt = 0.f;  g_hudVert = g_hudVertUser; }
+    if (st == 1) { g_hudCurve = true;  g_hudTilt = 0.f;  g_hudVert = g_hudVertUser; }
+    if (st == 2) { g_hudCurve = true;  g_hudTilt = 20.f; g_hudVert = g_hudVertUser - 0.35f; }
+}
 static float g_regs[256][4];                     // shadow of the vertex-shader float constants WAR uploaded
 static float g_pregs[256][4];                    // shadow of the pixel-shader float constants (phase 7d)
 static vrm::ScanKeys g_scanKeys = {};            // what the register scanners look for (left-eye matrices), and a version that changes with them
@@ -1793,6 +1813,10 @@ static bool VRCaptureEye(IDirect3DDevice9* dev, int eye, const RECT* srcRect)
 // Reads the side-by-side VR target (or the back buffer) back through plain D3D9, so it works with every hand-off path
 // (CPU, GPU/dgVoodoo, VK/DXVK). Written at half size as a 24-bit BMP to %TEMP%\WARVR_vr_snapshot_<pair>.bmp.
 static unsigned g_snapshotAt = 0;
+static unsigned g_snapshotCount = 1;               // vr_snapshot=N,K: K snapshots, N pairs apart
+static bool g_snapshotHudCycle = false;            // vr_snapshot_hud_cycle=on: next HUD style after each snapshot (rig testing)
+static void ApplyHudStyle(int st);
+static const char* HudStyleName(int s);
 static void VRSnapshot(IDirect3DDevice9* dev, unsigned pair)
 {
     IDirect3DSurface9* src = nullptr;
@@ -2060,18 +2084,36 @@ static void VRCompositeHud(IDirect3DDevice9* dev)
     const float uiAspect = g_logH ? (float)g_logW / (float)g_logH : (g_bbH ? (float)g_bbW / (float)g_bbH : 2.37f);
     const vrm::Mat3 q = (g_headOn.load() && g_frameQValid) ? g_frameQ : vrm::identity();
     const vrm::V3 hp = (g_positional && g_headOn.load() && g_frameQValid) ? g_headDeltaCam : vrm::V3{ 0, 0, 0 };
+    {   // lazy follow, once per frame
+        static LARGE_INTEGER last{}; LARGE_INTEGER now; QueryPerformanceCounter(&now);
+        LARGE_INTEGER f; QueryPerformanceFrequency(&f);
+        const float dt = last.QuadPart ? (float)((double)(now.QuadPart - last.QuadPart) / (double)f.QuadPart) : 0.f;
+        last = now;
+        if (g_hudFollow && g_headOn.load() && g_frameQValid)
+            g_hudYaw = vrm::lazyFollowYaw(g_hudYaw, vrm::headYawOf(q), dt, g_hudFollowDeg, 0.35f, &g_hudFollowing);
+        else { g_hudYaw = 0.f; g_hudFollowing = false; }
+    }
+    // The panel as a strip of quads: one column for a flat untilted panel, 32 when it is curved.
+    const int cols = g_hudCurve ? 32 : 1;
+    HudVertex mesh[2 * 33];
     for (int eye = 0; eye < 2; ++eye) {
-        float c[4][3];
-        if (!vrm::hudQuadEyeSpace(vrm::eyeOffsetCamera(g_eyeToHead[eye]), q, hp, g_hudDistance, g_hudWidth, uiAspect, g_hudVert, 0.05f, c)) continue;
+        const vrm::V3 eo = vrm::eyeOffsetCamera(g_eyeToHead[eye]);
+        bool any = false;
+        for (int i = 0; i <= cols; ++i) for (int r = 0; r < 2; ++r) {
+            const float u = (float)i / (float)cols, vv = (float)r;
+            float e[3];
+            vrm::hudPointToEye(vrm::hudPanelPoint(u, vv, g_hudDistance, g_hudWidth, uiAspect, g_hudVert, g_hudCurve, g_hudTilt, g_hudYaw), eo, q, hp, e);
+            if (e[2] > 0.05f) any = true;
+            mesh[i * 2 + r] = { e[0], e[1], e[2], u, vv };
+        }
+        if (!any) continue;
         int x, y, w, h; EyeRegion(eye, rtW, rtH, &x, &y, &w, &h);
         SetVP(dev, x, y, w, h);
         float pm[4][4];
         vrm::perspFromFrustum(g_eyeFrustum[eye][0], g_eyeFrustum[eye][1], g_eyeFrustum[eye][2], g_eyeFrustum[eye][3], 0.05f, 100.f, pm);
         D3DMATRIX proj; memcpy(&proj, pm, sizeof(proj));
         g_origSetTransform(dev, D3DTS_PROJECTION, &proj);
-        const HudVertex v[4] = { { c[0][0], c[0][1], c[0][2], 0.f, 0.f }, { c[1][0], c[1][1], c[1][2], 1.f, 0.f },
-                                 { c[2][0], c[2][1], c[2][2], 0.f, 1.f }, { c[3][0], c[3][1], c[3][2], 1.f, 1.f } };
-        g_origDrawPrimitiveUP(dev, D3DPT_TRIANGLESTRIP, 2, v, sizeof(HudVertex));
+        g_origDrawPrimitiveUP(dev, D3DPT_TRIANGLESTRIP, 2 * cols, mesh, sizeof(HudVertex));
     }
 
     g_origSetScissor(dev, &savedScissorRc);
@@ -2364,7 +2406,10 @@ static void VRBeforePresent(IDirect3DDevice9* dev)
             static unsigned errLogs = 0;
             if (g_vrPairs < 5 || errLogs++ < 20) Log("VR: submit pair %u (%s) -> left err=%d right err=%d\n", g_vrPairs, vkDone ? "VK" : (g_gpuActive ? "GPU" : "CPU"), (int)e0, (int)e1);
         }
-        if (g_snapshotAt && g_vrPairs + 1 == g_snapshotAt) VRSnapshot(dev, g_vrPairs + 1);
+        if (g_snapshotAt && (g_vrPairs + 1) % g_snapshotAt == 0 && (g_vrPairs + 1) / g_snapshotAt <= g_snapshotCount) {
+            VRSnapshot(dev, g_vrPairs + 1);
+            if (g_snapshotHudCycle) { ApplyHudStyle(g_hudStyle >= 2 ? 0 : g_hudStyle + 1); Log("vr_snapshot: HUD style now %s\n", HudStyleName(g_hudStyle)); }
+        }
         if (vkDone && (e0 || e1)) {
             if (++g_vkSubmitErrStreak >= 5) {           // SteamVR refuses the Vulkan images (e.g. missing extensions): use the CPU path
                 g_vkPathWanted = false; g_vkActive = false; g_vk.ReleaseCopy();
@@ -2830,10 +2875,10 @@ static void OpenLogEarly()
 //     head=PAGEUP
 // Key names: A-Z, 0-9, F1-F24, NUMPAD0-9, NUMPAD_DIVIDE/MULTIPLY/SUBTRACT/ADD/DECIMAL, INSERT, DELETE,
 //            HOME, END, PAGEUP, PAGEDOWN, PAUSE, SCROLLLOCK.
-enum Action { ACT_CAPTURE, ACT_SCAN, ACT_RECENTER, ACT_TEST, ACT_HEAD, ACT_VR, ACT_SCALE_UP, ACT_SCALE_DOWN, ACT_CULL, ACT_HUD_NEAR, ACT_HUD_FAR, ACT_RECENTER2, ACT_POSITIONAL, ACT_RECENTER3, ACT_CURSOR, ACT_PITCHLOCK, ACT_COUNT };
-static int g_keyVk[ACT_COUNT] = { 'C', 0 /*scan: unbound*/, 0 /*recenter: Numpad - now belongs to the pitch lock; recenter2/3 remain*/, VK_ADD, VK_INSERT, VK_MULTIPLY, VK_PRIOR, VK_NEXT, VK_HOME, VK_END, VK_DELETE, VK_DIVIDE, 'P', VK_OEM_2, 'M', VK_SUBTRACT };
-static const char* kActionName[ACT_COUNT] = { "capture", "scan", "recenter", "test", "head", "vr", "scale_up", "scale_down", "cull", "hud_near", "hud_far", "recenter2", "positional", "recenter3", "cursor", "pitch_lock" };
-static const char* kActionDesc[ACT_COUNT] = { "capture one frame", "scan memory for camera", "recenter forward", "20-degree rotation test", "head tracking on monitor", "VR mode on/off", "world scale up", "world scale down", "culling follows head on/off", "HUD closer", "HUD farther", "recenter forward (alternate key)", "head position tracking on/off", "recenter forward (main-keyboard slash)", "VR mouse cursor on/off", "mouse pitch lock on/off (mouse no longer tilts the view; the headset does)" };
+enum Action { ACT_CAPTURE, ACT_SCAN, ACT_RECENTER, ACT_TEST, ACT_HEAD, ACT_VR, ACT_SCALE_UP, ACT_SCALE_DOWN, ACT_CULL, ACT_HUD_NEAR, ACT_HUD_FAR, ACT_RECENTER2, ACT_POSITIONAL, ACT_RECENTER3, ACT_CURSOR, ACT_PITCHLOCK, ACT_HUD_STYLE, ACT_COUNT };
+static int g_keyVk[ACT_COUNT] = { 'C', 0 /*scan: unbound*/, 0 /*recenter: Numpad - now belongs to the pitch lock; recenter2/3 remain*/, VK_ADD, VK_INSERT, VK_MULTIPLY, VK_PRIOR, VK_NEXT, VK_HOME, VK_END, VK_DELETE, VK_DIVIDE, 'P', VK_OEM_2, 'M', VK_SUBTRACT, 'H' };
+static const char* kActionName[ACT_COUNT] = { "capture", "scan", "recenter", "test", "head", "vr", "scale_up", "scale_down", "cull", "hud_near", "hud_far", "recenter2", "positional", "recenter3", "cursor", "pitch_lock", "hud_cycle" };
+static const char* kActionDesc[ACT_COUNT] = { "capture one frame", "scan memory for camera", "recenter forward", "20-degree rotation test", "head tracking on monitor", "VR mode on/off", "world scale up", "world scale down", "culling follows head on/off", "HUD closer", "HUD farther", "recenter forward (alternate key)", "head position tracking on/off", "recenter forward (main-keyboard slash)", "VR mouse cursor on/off", "mouse pitch lock on/off (mouse no longer tilts the view; the headset does)", "HUD style: flat -> curved -> low" };
 
 static int ParseKey(const char* n)
 {
@@ -2865,7 +2910,8 @@ static void LoadHotkeyConfig()
         if (_stricmp(line, "eye_size") == 0) { g_eyeSizeCfg = (UINT)atoi(val); Log("WARVR.ini: eye_size -> %u\n", g_eyeSizeCfg); continue; }
         if (_stricmp(line, "positional") == 0) { g_positional = atoi(val) != 0; Log("WARVR.ini: positional -> %d\n", g_positional ? 1 : 0); continue; }
         if (_stricmp(line, "gpu_path") == 0) { g_gpuPathWanted = _stricmp(val, "off") != 0; Log("WARVR.ini: gpu_path -> %s\n", g_gpuPathWanted ? "auto" : "off"); continue; }
-        if (_stricmp(line, "vr_snapshot") == 0) { g_snapshotAt = (unsigned)atoi(val); Log("WARVR.ini: vr_snapshot -> %u\n", g_snapshotAt); continue; }
+        if (_stricmp(line, "vr_snapshot_hud_cycle") == 0) { g_snapshotHudCycle = (_stricmp(val, "on") == 0); continue; }
+        if (_stricmp(line, "vr_snapshot") == 0) { g_snapshotAt = (unsigned)atoi(val); const char* k = strchr(val, ','); g_snapshotCount = k ? (unsigned)atoi(k + 1) : 1; if (g_snapshotCount < 1) g_snapshotCount = 1; Log("WARVR.ini: vr_snapshot -> %u\n", g_snapshotAt); continue; }
         if (_stricmp(line, "auto_vr") == 0) { g_autoVr = _stricmp(val, "on") == 0 || _stricmp(val, "1") == 0; Log("WARVR.ini: auto_vr -> %s\n", g_autoVr ? "on" : "off"); continue; }
         if (_stricmp(line, "lazy_state") == 0) { g_lazyState = _stricmp(val, "on") == 0 || _stricmp(val, "1") == 0; Log("WARVR.ini: lazy_state -> %s\n", g_lazyState ? "on (experimental)" : "off"); continue; }
         if (_stricmp(line, "vk_path") == 0) { g_vkPathWanted = _stricmp(val, "off") != 0; Log("WARVR.ini: vk_path -> %s\n", g_vkPathWanted ? "auto" : "off"); continue; }
@@ -2887,7 +2933,16 @@ static void LoadHotkeyConfig()
         if (_stricmp(line, "hud_anchor") == 0) { g_hudAnchor = (_stricmp(val, "head") == 0) ? 0 : (_stricmp(val, "billboard") == 0 ? 1 : 2); Log("WARVR.ini: hud_anchor -> %s\n", g_hudAnchor == 2 ? "world (a flat panel fixed in the game's frame)" : (g_hudAnchor == 1 ? "billboard (anchored in the game's frame, always faces you)" : "head (locked to the headset)")); continue; }
         if (_stricmp(line, "hud_distance") == 0) { float v = (float)atof(val); if (v > 0.2f) g_hudDistance = v; Log("WARVR.ini: hud_distance -> %.2f m\n", g_hudDistance); continue; }
         if (_stricmp(line, "hud_width") == 0) { float v = (float)atof(val); if (v > 0.1f) g_hudWidth = v; Log("WARVR.ini: hud_width -> %.2f m\n", g_hudWidth); continue; }
-        if (_stricmp(line, "hud_vertical") == 0) { g_hudVert = (float)atof(val); Log("WARVR.ini: hud_vertical -> %.2f m\n", g_hudVert); continue; }
+        if (_stricmp(line, "hud_vertical") == 0) { g_hudVertUser = (float)atof(val); g_hudVert = g_hudVertUser + (g_hudStyle == 2 ? -0.35f : 0.f); Log("WARVR.ini: hud_vertical -> %.2f m\n", g_hudVert); continue; }
+        if (_stricmp(line, "hud_style") == 0) {
+            const int st = _stricmp(val, "curved") == 0 ? 1 : (_stricmp(val, "low") == 0 ? 2 : 0);
+            ApplyHudStyle(st);
+            Log("WARVR.ini: hud_style -> %s (curve %s, tilt %.0f deg, vertical %.2f m)\n", HudStyleName(st), g_hudCurve ? "on" : "off", g_hudTilt, g_hudVert);
+            continue; }
+        if (_stricmp(line, "hud_curve") == 0) { g_hudCurve = !(_stricmp(val, "off") == 0 || _stricmp(val, "0") == 0); g_hudStyle = 3; Log("WARVR.ini: hud_curve -> %s\n", g_hudCurve ? "on" : "off"); continue; }
+        if (_stricmp(line, "hud_tilt") == 0) { float v = (float)atof(val); if (v >= -60.f && v <= 60.f) g_hudTilt = v; g_hudStyle = 3; Log("WARVR.ini: hud_tilt -> %.1f deg\n", g_hudTilt); continue; }
+        if (_stricmp(line, "hud_follow") == 0) { g_hudFollow = (_stricmp(val, "lazy") == 0 || _stricmp(val, "on") == 0); Log("WARVR.ini: hud_follow -> %s\n", g_hudFollow ? "lazy" : "off"); continue; }
+        if (_stricmp(line, "hud_follow_deg") == 0) { float v = (float)atof(val); if (v >= 5.f && v <= 170.f) g_hudFollowDeg = v; Log("WARVR.ini: hud_follow_deg -> %.0f\n", g_hudFollowDeg); continue; }
         if (_stricmp(line, "steer") == 0) {
             if (_stricmp(val, "constants") == 0) { g_steerMode = 1; Log("WARVR.ini: steer -> constants (older method)\n"); }
             else if (_stricmp(val, "camera") == 0) { g_steerMode = 0; Log("WARVR.ini: steer -> camera\n"); }
@@ -2971,6 +3026,11 @@ static void RunAction(Action a, const char* via)
         BeepAsync(a == ACT_HUD_NEAR ? 900 : 600, 60);
         Log("HUD distance = %.2f m (width %.2f m)\n", g_hudDistance, g_hudWidth);
         break;
+    case ACT_HUD_STYLE: {
+        const int next = (g_hudStyle >= 2) ? 0 : g_hudStyle + 1;
+        ApplyHudStyle(next); BeepAsync(700 + 300 * next, 80);
+        Log("HUD style = %s (curve %s, tilt %.0f deg, vertical %.2f m)\n", HudStyleName(next), g_hudCurve ? "on" : "off", g_hudTilt, g_hudVert);
+        break; }
     case ACT_CURSOR: {
         g_cursorOn = !g_cursorOn; BeepAsync(g_cursorOn ? 1400 : 500, 120);
         Log("VR mouse cursor = %d\n", g_cursorOn ? 1 : 0);

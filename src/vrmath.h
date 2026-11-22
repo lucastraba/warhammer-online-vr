@@ -758,6 +758,57 @@ inline bool hudQuadEyeSpace(const V3& eyeOff, const Mat3& q, const V3& headPos, 
     return any;
 }
 
+// ---- HUD panel shape and lazy follow ------------------------------------------------------------------------------
+// One point of the HUD panel in the game camera's frame (x right, y up, z forward, metres from the default head
+// position), for texture coordinates u, v in [0,1] (v = 0 at the top).
+//   curved = false: a flat rectangle widthM wide at `distance` (the original panel).
+//   curved = true : a strip of a cylinder around the head with radius `distance`, spanning the same angle as the flat
+//                   panel would (so switching it on keeps the HUD's size and only bends it). Every column of the HUD is
+//                   then the same distance away and faces you, so the edges are as readable as the middle.
+//   tiltDeg       : leans the panel back about its horizontal centre line (top farther away), so a panel placed below
+//                   eye level (vertM < 0) faces a downward glance. 0 = upright.
+//   yaw           : turns the whole panel about the vertical axis through the head (radians, + = to the right).
+inline V3 hudPanelPoint(float u, float v, float distance, float widthM, float uiAspect, float vertM, bool curved,
+                        float tiltDeg, float yaw) {
+    const float hh = widthM / uiAspect * 0.5f;
+    const float yl = hh - v * 2.f * hh;
+    const float t = tiltDeg * 3.14159265f / 180.f;
+    const float dy = yl * std::cos(t), dz = yl * std::sin(t);
+    float x, z;
+    if (curved) {
+        const float half = std::atan(widthM * 0.5f / distance), th = (u - 0.5f) * 2.f * half, r = distance + dz;
+        x = r * std::sin(th); z = r * std::cos(th);
+    }
+    else { x = (u - 0.5f) * widthM; z = distance + dz; }
+    const float cy = std::cos(yaw), sy = std::sin(yaw);
+    return { x * cy + z * sy, vertM + dy, -x * sy + z * cy };
+}
+// The same transform hudQuadEyeSpace applies to its corners: game frame -> this eye's space.
+inline void hudPointToEye(const V3& pt, const V3& eyeOff, const Mat3& q, const V3& headPos, float out[3]) {
+    const float rel[3] = { pt.x - headPos.x, pt.y - headPos.y, pt.z - headPos.z };
+    for (int c = 0; c < 3; ++c) out[c] = rel[0]*q.m[0][c] + rel[1]*q.m[1][c] + rel[2]*q.m[2][c];
+    out[0] -= eyeOff.x; out[1] -= eyeOff.y; out[2] -= eyeOff.z;
+}
+// Heading of the head in the game frame (radians, + = right), for the head rotation q as used above.
+inline float headYawOf(const Mat3& q) { return std::atan2(q.m[0][2], q.m[2][2]); }
+inline float wrapPi(float a) {
+    while (a > 3.14159265f) a -= 6.2831853f;
+    while (a < -3.14159265f) a += 6.2831853f;
+    return a;
+}
+// Lazy follow: the panel stays where it is while you look around it, and once your heading is more than startDeg away
+// it glides after you (time constant tau seconds) until it is back within 2 degrees. *following carries that state.
+inline float lazyFollowYaw(float panelYaw, float headYaw, float dt, float startDeg, float tau, bool* following) {
+    const float d = wrapPi(headYaw - panelYaw), ad = std::fabs(d) * 180.f / 3.14159265f;
+    if (!*following && ad > startDeg) *following = true;
+    if (*following) {
+        if (ad < 2.f) { *following = false; return panelYaw; }
+        const float k = (dt <= 0.f) ? 0.f : (dt >= tau * 4.f ? 1.f : 1.f - std::exp(-dt / tau));
+        return wrapPi(panelYaw + d * k);
+    }
+    return panelYaw;
+}
+
 // ---- planar water reflection (phase 7f) --------------------------------------------------------------------------
 // WAR renders the reflection map once per frame from a "reflection camera" that is the game camera mirrored about z:
 //   right' = M right, fwd' = M fwd, up' = -M up   (M flips z), same position. The shader then looks the map up with the

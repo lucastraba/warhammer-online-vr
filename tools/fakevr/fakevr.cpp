@@ -54,6 +54,8 @@ struct Config {
     float cant_deg = 0.f;                                 // eye rotation about +y (canted displays); 0 = parallel
     int pose = 0;                                         // 0 static, 1 sweep
     double sweep_deg = 30.0, sweep_period_s = 8.0, bob_m = 0.02;
+    double head_yaw_deg = 0.0, head_pitch_deg = 0.0;      // pose=static: fixed head turn (+yaw = right, +pitch = up)
+    uint64_t turn_after_submits = 0;                      // ...applied only after this many accepted submits (0 = from the start)
     uint32_t dump_every = 0;
     int fail_init = 0;
     int fail_init_error = EVRInitError_VRInitError_Init_HmdNotFound;
@@ -258,6 +260,9 @@ void LoadConfig()
             else if (!strcmp(k, "sweep_deg")) c.sweep_deg = atof(v);
             else if (!strcmp(k, "sweep_period_s")) c.sweep_period_s = atof(v);
             else if (!strcmp(k, "bob_m")) c.bob_m = atof(v);
+            else if (!strcmp(k, "head_yaw_deg")) c.head_yaw_deg = atof(v);
+            else if (!strcmp(k, "head_pitch_deg")) c.head_pitch_deg = atof(v);
+            else if (!strcmp(k, "turn_after_submits")) c.turn_after_submits = strtoull(v, nullptr, 10);
             else if (!strcmp(k, "dump_every")) c.dump_every = (uint32_t)strtoul(v, nullptr, 10);
             else if (!strcmp(k, "fail_init")) c.fail_init = atoi(v);
             else if (!strcmp(k, "fail_init_error")) c.fail_init_error = atoi(v);
@@ -287,8 +292,9 @@ void LoadConfig()
     Log("config: refresh_hz=%.3f size=%ux%u ipd=%.4f fov=%s L[l=%.3f r=%.3f t=%.3f b=%.3f] R[l=%.3f r=%.3f t=%.3f b=%.3f] cant_deg=%.2f",
         c.refresh_hz, c.width, c.height, c.ipd, c.fov, c.tan[0][0], c.tan[0][1], c.tan[0][2], c.tan[0][3],
         c.tan[1][0], c.tan[1][1], c.tan[1][2], c.tan[1][3], c.cant_deg);
-    Log("config: pose=%s sweep_deg=%.1f sweep_period_s=%.2f bob_m=%.3f dump_every=%u fail_init=%d (error %d)",
-        c.pose ? "sweep" : "static", c.sweep_deg, c.sweep_period_s, c.bob_m, c.dump_every, c.fail_init, c.fail_init_error);
+    Log("config: pose=%s sweep_deg=%.1f sweep_period_s=%.2f bob_m=%.3f head_yaw_deg=%.1f head_pitch_deg=%.1f turn_after_submits=%llu dump_every=%u fail_init=%d (error %d)",
+        c.pose ? "sweep" : "static", c.sweep_deg, c.sweep_period_s, c.bob_m, c.head_yaw_deg, c.head_pitch_deg,
+        (unsigned long long)c.turn_after_submits, c.dump_every, c.fail_init, c.fail_init_error);
 }
 
 void EnsureConfig() { if (!g_cfgLoaded) LoadConfig(); }
@@ -320,6 +326,15 @@ void HeadPose(double t, TrackedDevicePose_t* p)
         x = 0.5 * g_cfg.bob_m * std::sin(w * t); vx = 0.5 * g_cfg.bob_m * w * std::cos(w * t);
     }
     p->mDeviceToAbsoluteTracking = RotY(yaw, (float)x, (float)y, 0.f);
+    if (g_cfg.pose == 0 && (g_cfg.head_yaw_deg != 0.0 || g_cfg.head_pitch_deg != 0.0) && g_s.submitsOk >= g_cfg.turn_after_submits) {
+        // Fixed head turn: R = Ry(-yaw) * Rx(pitch). OpenVR looks down -z, so +yaw (right) is a negative rotation about +y.
+        const double a = -g_cfg.head_yaw_deg * 3.14159265358979 / 180.0, b = g_cfg.head_pitch_deg * 3.14159265358979 / 180.0;
+        const float ca = (float)std::cos(a), sa = (float)std::sin(a), cb = (float)std::cos(b), sb = (float)std::sin(b);
+        HmdMatrix34_t& m = p->mDeviceToAbsoluteTracking;
+        m.m[0][0] = ca;  m.m[0][1] = sa * sb; m.m[0][2] = sa * cb;
+        m.m[1][0] = 0;   m.m[1][1] = cb;      m.m[1][2] = -sb;
+        m.m[2][0] = -sa; m.m[2][1] = ca * sb; m.m[2][2] = ca * cb;
+    }
     p->vVelocity.v[0] = (float)vx; p->vVelocity.v[1] = (float)vy;
     p->vAngularVelocity.v[1] = (float)yawRate;
     p->eTrackingResult = ETrackingResult_TrackingResult_Running_OK;
