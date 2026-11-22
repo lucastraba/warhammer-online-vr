@@ -1,6 +1,8 @@
 # Running WARVR on DXVK instead of dgVoodoo (experimental)
 
-**Status: compiles, follows the same interop sequence Proton uses for DXVK games in SteamVR, NOT yet tested in a headset.**
+**Status: runs in the game under Wine with a fake headset (`tools/fakevr`): VR on, every frame handed over as one
+VkImage with no copy, every submit accepted, correct stereo picture (checked with `vr_snapshot`). NOT yet tested
+with SteamVR or a real headset, and not on Windows.** Details: [tools/linux-rig/README.md](../tools/linux-rig/README.md).
 If you try it, please send `%TEMP%\WARVR.log` (with `log=on`) whether it works or not.
 
 ## Why

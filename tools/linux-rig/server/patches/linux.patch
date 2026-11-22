@@ -1,0 +1,101 @@
+diff --git a/FrameWork/NetWork/TCPManager.cs b/FrameWork/NetWork/TCPManager.cs
+index 5b8c48d5..b13d7779 100644
+--- a/FrameWork/NetWork/TCPManager.cs
++++ b/FrameWork/NetWork/TCPManager.cs
+@@ -277,7 +277,9 @@ namespace FrameWork
+         {
+             try
+             {
+-                Listener = new TcpListener(IPAddress.Any, port);
++                string bindEnv = Environment.GetEnvironmentVariable("PROJECTWAR_BIND_ADDRESS");
++                IPAddress bindAddress = string.IsNullOrEmpty(bindEnv) ? IPAddress.Any : IPAddress.Parse(bindEnv);
++                Listener = new TcpListener(bindAddress, port);
+                 Listener.Server.ReceiveBufferSize = BUF_SIZE;
+                 Listener.Server.SendBufferSize = BUF_SIZE;
+                 Listener.Server.NoDelay = false;
+diff --git a/LobbyServer/NetWork/Client.cs b/LobbyServer/NetWork/Client.cs
+index a41e1505..d3e5a58a 100644
+--- a/LobbyServer/NetWork/Client.cs
++++ b/LobbyServer/NetWork/Client.cs
+@@ -1,4 +1,4 @@
+-﻿
++
+ using System;
+ using System.Collections.Generic;
+ using System.Linq;
+@@ -78,10 +78,15 @@ namespace LobbyServer
+                         {
+                             long pos = packet.Position;
+ 
+-                            packet.Opcode = _opcode;
+-                            packet.Size = (ulong)_expectedSize;
++                            // Handlers read the whole buffer (packet.ToArray()), so give them the body alone. Header and body
++                            // arrive as two reads on Windows; on Linux loopback they come in one, and the header broke the parse.
++                            byte[] body = new byte[_expectedSize];
++                            Array.Copy(packetBuffer, (int)pos, body, 0, _expectedSize);
++                            PacketIn bodyPacket = new PacketIn(body, 0, body.Length);
++                            bodyPacket.Opcode = _opcode;
++                            bodyPacket.Size = (ulong)_expectedSize;
+ 
+-                            Server.HandlePacket(this, packet);
++                            Server.HandlePacket(this, bodyPacket);
+ 
+                             bytesLeft -= _expectedSize;
+                             packet.Position = pos;
+diff --git a/WorldServer/Program.cs b/WorldServer/Program.cs
+index 55c7ea51..136700f8 100644
+--- a/WorldServer/Program.cs
++++ b/WorldServer/Program.cs
+@@ -119,7 +119,7 @@ namespace WorldServer
+ 
+             // Ensure native dependencies moved under /libs are discoverable by DllImport.
+             string libsPath = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "libs");
+-            if (Directory.Exists(libsPath))
++            if (Directory.Exists(libsPath) && Environment.OSVersion.Platform == PlatformID.Win32NT)
+                 SetDllDirectory(libsPath);
+ 
+             // Loading log level from file
+@@ -318,10 +318,42 @@ namespace WorldServer
+                 }
+             };
+ 
+-            if (!SetConsoleCtrlHandler(_consoleCtrlHandler, true))
++            if (Environment.OSVersion.Platform != PlatformID.Win32NT)
++                RegisterUnixSignalHandler();
++
++            if (Environment.OSVersion.Platform == PlatformID.Win32NT && !SetConsoleCtrlHandler(_consoleCtrlHandler, true))
+                 Log.Error("Shutdown", "SetConsoleCtrlHandler failed; only Ctrl+C will shut down cleanly.");
+         }
+ 
++        /// <summary>Linux/Mono: waits for SIGTERM or SIGINT on a background thread, then stops cleanly.</summary>
++        private static void RegisterUnixSignalHandler()
++        {
++            try
++            {
++                var asm = System.Reflection.Assembly.Load("Mono.Posix, Version=4.0.0.0, Culture=neutral, PublicKeyToken=0738eb9f132ed756");
++                Type sigType = asm.GetType("Mono.Unix.UnixSignal", true);
++                Type numType = asm.GetType("Mono.Unix.Native.Signum", true);
++                Array signals = Array.CreateInstance(sigType, 2);
++                signals.SetValue(Activator.CreateInstance(sigType, Enum.Parse(numType, "SIGTERM")), 0);
++                signals.SetValue(Activator.CreateInstance(sigType, Enum.Parse(numType, "SIGINT")), 1);
++                var waitAny = sigType.GetMethod("WaitAny", new[] { signals.GetType() });
++                var thread = new Thread(() =>
++                {
++                    waitAny.Invoke(null, new object[] { signals });
++                    Shutdown("unix signal");
++                    Environment.Exit(0);
++                });
++                thread.IsBackground = true;
++                thread.Name = "UnixSignalHandler";
++                thread.Start();
++                Log.Info("Shutdown", "SIGTERM/SIGINT will stop the server cleanly.");
++            }
++            catch (Exception e)
++            {
++                Log.Error("Shutdown", "Unix signal handler unavailable: " + e.Message);
++            }
++        }
++
+         static void onError(object sender, UnhandledExceptionEventArgs e)
+         {
+             Log.Error("onError", e.ExceptionObject.ToString());

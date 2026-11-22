@@ -1,0 +1,13 @@
+#!/bin/bash
+# warctl start|stop|restart|status|ports|logs <account|launcher|lobby|world> [lines]
+unit() { case "$1" in account*|Account*) echo war-accountcacher;; launcher*|Launcher*) echo war-launcher;;
+                      lobby*|Lobby*) echo war-lobby;; world*|World*) echo war-world;; *) echo "$1";; esac; }
+case "${1:-status}" in
+  start)   systemctl --user start war-server.target ;;
+  stop)    systemctl --user stop war-world war-lobby war-launcher; systemctl --user stop war-accountcacher war-server.target ;;
+  restart) "$0" stop; "$0" start ;;
+  status)  systemctl --user --no-pager list-units war-server.target war-accountcacher.service war-launcher.service war-lobby.service war-world.service --all; pgrep -af '[m]ono --debug' ;;
+  ports)   (sudo -n ss -ltnp 2>/dev/null || ss -ltnp) | grep -E '"(mono|mysqld)"' ;;
+  logs)    journalctl --user -u "$(unit "$2")" -n "${3:-100}" --no-pager ;;
+  *) echo "usage: warctl start|stop|restart|status|ports|logs <account|launcher|lobby|world> [lines]"; exit 1 ;;
+esac
