@@ -69,6 +69,9 @@ Both hand-off paths, in the world, VR on via `auto_vr`, a 4032x2240 side-by-side
 | DXVK d3d9 | VK: one VkImage, both eyes, no copy | all `err=0` | correct stereo pair, HUD in both eyes | 2.3 |
 | dgVoodoo on DXVK d3d11 | GPU: D3D11 copy of the game's render target | all `err=0` | correct stereo pair, HUD in both eyes | 1.6 |
 
+Repeated on both layers with the MSVC build from CI that went into the release
+(`warvr-fork-2026.11.22`, commit 5e83f2f): same result.
+
 `lazy_state=on` on dgVoodoo: correct picture as well, and the log's `PERF lazy_state` line shows about 3,800
 restore calls per frame avoided (the game re-sent the values itself).
 
