@@ -13,6 +13,7 @@ This fork adds a build for people who don't compile, plus two experimental optio
 -DXVK instead of dgVoodoo: see docs\DXVK.md.
 
 -HUD shape: Ctrl+Shift+H switches the HUD between flat (as before), curved (bent around you, so the minimap and chat at the edges face you) and low (curved, lower and leaned back, a glance down). hud_style=flat|curved|low in WARVR.ini picks the one it starts with.
+-Laser pointer: Ctrl+Shift+L (or laser=on in WARVR.ini) draws a red beam along the line the game itself uses for the mouse, ending in a dot on whatever the cursor is really pointing at, so you no longer have to wait for something to highlight. laser_origin=hand|eyes picks where the beam starts (hand: low and to the right; eyes: straight out from your view, only the dot shows), laser_width=3 sets its width in pixels. VR only.
 
 -draw_distance now also works without VR (flat screen).
 

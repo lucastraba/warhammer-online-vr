@@ -727,6 +727,37 @@ int main() {
         CHECK(std::fabs(y - 1.2f) < 2.f / 57.29578f && !fol);
         CHECK(std::fabs(wrapPi(3.5f) - (3.5f - 6.2831853f)) < 1e-5f);
     }
+    {   // laser pointer helpers
+        printf("\n[laser pointer]\n");
+        const float fr[4] = { -0.8f, 0.8f, 0.45f, -0.45f };
+        const V3 c = pickRayCamera(0.5f, 0.5f, fr);
+        CHECK(std::fabs(c.x) < 1e-6f && std::fabs(c.y) < 1e-6f && std::fabs(c.z - 1.f) < 1e-6f);
+        const V3 tl = pickRayCamera(0.f, 0.f, fr);                       // top-left corner: left and up
+        CHECK(tl.x < 0.f && tl.y > 0.f && std::fabs(tl.x / tl.z + 0.8f) < 1e-5f && std::fabs(tl.y / tl.z - 0.45f) < 1e-5f);
+        const V3 br = pickRayCamera(1.f, 1.f, fr);
+        CHECK(br.x > 0.f && br.y < 0.f);
+        // a point on the ray projects to the cursor position with the matching projection
+        float P[4][4]; perspFromFrustum(fr[0], fr[1], fr[2], fr[3], 1.f, 100.f, P);
+        const V3 r = pickRayCamera(0.25f, 0.75f, fr);
+        const float pt[3] = { r.x * 10.f, r.y * 10.f, r.z * 10.f };
+        float cl[4]; xformPoint(pt, P, cl);
+        const float sx = (cl[0] / cl[3] + 1.f) * 0.5f, sy = (1.f - cl[1] / cl[3]) * 0.5f;
+        printf("ray point at u=0.25 v=0.75 projects to (%.4f, %.4f)\n", sx, sy);
+        CHECK(std::fabs(sx - 0.25f) < 1e-4f && std::fabs(sy - 0.75f) < 1e-4f);
+        // clipping against w
+        float a[4] = { 0, 0, 0, -1.f }, b[4] = { 0, 0, 0, 3.f };
+        CHECK(clipSegmentW(a, b, 0.5f) && std::fabs(a[3] - 0.5f) < 1e-5f && b[3] == 3.f);
+        float a2[4] = { 0, 0, 0, -1.f }, b2[4] = { 0, 0, 0, 0.1f };
+        CHECK(!clipSegmentW(a2, b2, 0.5f));
+        // probes and hit
+        CHECK(std::fabs(laserProbeDistance(0, 5, 1.f, 16.f) - 1.f) < 1e-5f && std::fabs(laserProbeDistance(4, 5, 1.f, 16.f) - 16.f) < 1e-3f);
+        CHECK(std::fabs(laserProbeDistance(2, 5, 1.f, 16.f) - 4.f) < 1e-4f);
+        const float d[6] = { 1, 2, 4, 8, 16, 32 };
+        const int s1[6] = { 1, 1, 1, 0, 0, 0 };   CHECK(std::fabs(laserHitDistance(s1, d, 6) - std::sqrt(32.f)) < 1e-4f);
+        const int s2[6] = { 1, 1, 1, 1, 1, 1 };   CHECK(laserHitDistance(s2, d, 6) < 0.f);      // sky
+        const int s3[6] = { -1, 0, 1, -1, 0, 0 }; CHECK(std::fabs(laserHitDistance(s3, d, 6) - 8.f) < 1e-4f);   // hidden before any visible probe is ignored; first hidden after a visible one counts
+        const int s4[6] = { 0, 0, 0, 0, 0, 0 };   CHECK(laserHitDistance(s4, d, 6) < 0.f);
+    }
     printf(fails ? "\n%d FAILURES\n" : "\nALL TESTS PASSED\n", fails);
     return fails ? 1 : 0;
 }

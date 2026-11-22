@@ -809,6 +809,46 @@ inline float lazyFollowYaw(float panelYaw, float headYaw, float dt, float startD
     return panelYaw;
 }
 
+// ---- laser pointer ---------------------------------------------------------------------------------------------------
+// Direction of the game's mouse-pick ray in its camera's axes (x right, y up, z forward), for the cursor at texture
+// coordinates u, v (v = 0 at the top) and the camera's Gamebryo frustum {left, right, top, bottom} at unit distance.
+// Normalised. This is the ray the game itself uses to decide what is under the mouse.
+inline V3 pickRayCamera(float u, float v, const float fr[4]) {
+    const float x = fr[0] + u * (fr[1] - fr[0]), y = fr[2] + v * (fr[3] - fr[2]);
+    const float n = std::sqrt(x * x + y * y + 1.f);
+    return { x / n, y / n, 1.f / n };
+}
+// Row vector [x y z 1] times a 4x4 matrix (D3D convention): clip-space position.
+inline void xformPoint(const float p[3], const float m[4][4], float out[4]) {
+    for (int c = 0; c < 4; ++c) out[c] = p[0] * m[0][c] + p[1] * m[1][c] + p[2] * m[2][c] + m[3][c];
+}
+// Clip the segment a-b (clip space) to w >= eps, in place. False if nothing is left in front of the eye.
+inline bool clipSegmentW(float a[4], float b[4], float eps) {
+    if (a[3] < eps && b[3] < eps) return false;
+    if (a[3] < eps || b[3] < eps) {
+        float* in = a[3] >= eps ? a : b; float* out = a[3] >= eps ? b : a;
+        const float t = (in[3] - eps) / (in[3] - out[3]);
+        for (int c = 0; c < 4; ++c) out[c] = in[c] + (out[c] - in[c]) * t;
+    }
+    return true;
+}
+// Probe i of n along the ray, log-spaced from dmin to dmax (any units).
+inline float laserProbeDistance(int i, int n, float dmin, float dmax) {
+    if (n < 2) return dmin;
+    return dmin * std::pow(dmax / dmin, (float)i / (float)(n - 1));
+}
+// Where the ray hits, from the probes' visibility (1 visible, 0 hidden behind something, -1 not tested / off screen):
+// the first hidden probe that follows a visible one. Returns the geometric mean of the two distances, or -1 (sky,
+// nothing hit, or no visible probe to anchor on).
+inline float laserHitDistance(const int* state, const float* dist, int n) {
+    int lastVisible = -1;
+    for (int i = 0; i < n; ++i) {
+        if (state[i] == 1) lastVisible = i;
+        else if (state[i] == 0 && lastVisible >= 0) return std::sqrt(dist[lastVisible] * dist[i]);
+    }
+    return -1.f;
+}
+
 // ---- planar water reflection (phase 7f) --------------------------------------------------------------------------
 // WAR renders the reflection map once per frame from a "reflection camera" that is the game camera mirrored about z:
 //   right' = M right, fwd' = M fwd, up' = -M up   (M flips z), same position. The shader then looks the map up with the

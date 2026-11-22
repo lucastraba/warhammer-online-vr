@@ -91,6 +91,14 @@
 ;                    so the minimap and chat in the corners are easier to read.
 ; low              = curved, 0.35 m lower and leaned back 20 degrees: more of the world ahead is clear, the HUD is a glance down.
 ;hud_style=flat
+; Laser pointer (VR only; Ctrl+Shift+L toggles it while you play): a red beam along the game's own mouse line,
+; ending in a dot on the thing the cursor actually points at. Off by default.
+;laser=on
+; Where the beam starts: hand (low and to the right) or eyes (from your view: you mostly see just the dot).
+;laser_origin=hand
+; Beam width in pixels (1-20).
+;laser_width=3
+
 ; Fine-tuning (after hud_style; any of these makes the style "custom"):
 ;hud_curve=off
 ;hud_tilt=0                 (degrees; positive leans the top away from you)

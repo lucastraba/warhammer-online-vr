@@ -319,6 +319,15 @@ static const char* g_gpuWhy = "";
 static unsigned g_desktopEvery = 0;              // INI desktop_every: present to the desktop every Nth frame, 0 = never while in VR
 static bool g_cursorOn = true;                   // INI cursor=on|off, key M
 static float g_cursorSize = 0.045f;              // arrow height as a fraction of the HUD height
+// Laser pointer (INI laser=on, key L): a beam along the game's own mouse-pick ray, ending in a dot where it hits the
+// world, so it is obvious what the cursor points at. The hit is found with occlusion queries against this frame's depth.
+static bool g_laserOn = false;
+static bool g_laserDone = false;                  // drawn this frame already (reset after Present)
+static bool g_laserAtClearLogged = false;
+static int g_laserOrigin = 0;                     // 0 = from low and to the right of you ("hand"), 1 = from your eyes
+static float g_laserPx = 3.f;                     // beam width in pixels
+static bool g_pickValid = false;                  // the game's own camera of the last VR frame: what its mouse picking uses
+static float g_pickPos[3], g_pickR[3], g_pickU[3], g_pickF[3], g_pickFr[4];
 static HWND g_gameHwnd = nullptr;
 static int g_resMode = 2;                        // INI vr_resolution: 0 = desktop, 1 = steamvr (always), 2 = auto (steamvr when the GPU hand-off is available)
 static double g_maxPixels = 0, g_renderScale = 1.0;   // 0 = no pixel budget: SteamVR's exact size, only clamped to what the D3D9 device allows
@@ -595,6 +604,7 @@ static void EyeViewportRect(int eye, int rtW, int rtH, bool hud, int* ox, int* o
 // All of the game's HUD draws of a frame are rendered ONCE into g_hudTex (the whole 2D UI at a resolution of our choosing). At the
 // end of the frame it is drawn as a flat quad per eye, placed in space with that eye's real projection, so it behaves like a
 // physical panel: it stays put, looks tilted from the side, and leaves the view naturally.
+static void LaserRelease();
 static void VRHudRelease()
 {
     if (g_hudSavedRT) { g_hudSavedRT->Release(); g_hudSavedRT = nullptr; }
@@ -1187,12 +1197,20 @@ static HRESULT WINAPI HookSetViewport(IDirect3DDevice9* s, const D3DVIEWPORT9* v
     return g_origSetViewport(s, use);
 }
 
+static void VRDrawLaser(IDirect3DDevice9* dev);
 static HRESULT WINAPI HookClear(IDirect3DDevice9* s, DWORD c, const D3DRECT* r, DWORD f, D3DCOLOR col, float z, DWORD st)
 {
     ++g_stats.clears;
     LazyFlushVP(s);                                                            // Clear without rects clears the viewport
     if (g_redirect && g_rtIsMain && (f & D3DCLEAR_TARGET)) col |= 0xFF000000u;       // X8 semantics: alpha is always 1
     Cap("CLEAR rects=%lu flags=0x%lX color=0x%08lX z=%.3f", (unsigned long)c, (unsigned long)f, (unsigned long)col, z);
+    // The game clears depth on its own before drawing the 2D UI: last moment the world's depth is there for the laser.
+    if (g_laserOn && g_vrActive && g_redirect && g_rtIsMain && (f & D3DCLEAR_ZBUFFER) && !(f & D3DCLEAR_TARGET) && !g_hudBound &&
+        g_frameMainPerspDraws > 50 && !g_laserDone) {
+        LazyFlush(s);
+        VRDrawLaser(s);
+        if (g_laserDone && g_log && !g_laserAtClearLogged) { g_laserAtClearLogged = true; Log("LASER: drawn at the game's depth clear (before its 2D UI)\n"); }
+    }
     if (g_redirect && g_rtIsMain && c && r && c <= 16 && g_logW && g_logH) {
         D3DRECT sc[16];
         const float sx = (float)g_bbW / (float)g_logW, sy = (float)g_bbH / (float)g_logH;
@@ -1453,6 +1471,13 @@ static void WAR_THISCALL HookSetCamera(void* self, void* edx, const Vec3f* pos, 
             }
             if (ok) {
                 g_gameR = oRight; g_gameU = oUp; g_gameF = oFwd; g_gameBasisValid = true;     // the game's own camera, for recognising its reflection
+                if (g_vrActive) {                                                               // ...and for the laser pointer
+                    g_pickPos[0] = oPos.x; g_pickPos[1] = oPos.y; g_pickPos[2] = oPos.z;
+                    g_pickR[0] = oRight.x; g_pickR[1] = oRight.y; g_pickR[2] = oRight.z;
+                    g_pickU[0] = oUp.x; g_pickU[1] = oUp.y; g_pickU[2] = oUp.z;
+                    g_pickF[0] = oFwd.x; g_pickF[1] = oFwd.y; g_pickF[2] = oFwd.z;
+                    memcpy(g_pickFr, oFr, sizeof(g_pickFr)); g_pickValid = true;
+                }
                 ComputeSteered(oPos, oRight, oUp, oFwd, oFr, *q, &S);
                 float rot[9]; vrm::basisToGamebryoRot(S.fwd, S.up, S.right, rot);
                 memcpy(cam + 0x60, rot, sizeof(rot));
@@ -1942,6 +1967,7 @@ static void VRRedirectEnd(IDirect3DDevice9* dev)
 {
     g_reflSurf = nullptr; g_reflTex = nullptr; g_reflStageMask = 0; g_reflHandled = false; g_lastOffscreenRT = nullptr; g_reflTexSearches = 0;
     VRHudRelease();                           // default-pool HUD texture: must go before a Reset or when VR stops
+    LaserRelease();                           // the beam's occlusion queries
     if (!g_redirect) return;
     g_redirect = false;
     if (dev) {
@@ -2032,6 +2058,232 @@ static void VRDrawCursor(IDirect3DDevice9* dev)
     dev->SetPixelShader(ps); if (ps) ps->Release();
     dev->SetTexture(0, tex0); if (tex0) tex0->Release();
     g_origSetViewport(dev, &g_devVP);
+}
+
+// ---- laser pointer ---------------------------------------------------------------------------------------------------
+// The game decides what is under the mouse with a ray from its own (unsteered) camera through the cursor. In VR you see
+// the world from elsewhere (head turned, two eyes) and the cursor sits on the HUD panel, so it does not line up with
+// what it points at. This draws that ray: invisible probes along it, tested against this frame's depth with occlusion
+// queries (read one frame later), give the first surface it hits; a beam goes from the "hand" (or your eyes) to there,
+// with a dot at the hit. Drawn before the HUD panel, so UI in front of it covers it, like it covers the world.
+static const int kLaserProbes = 64;               // first half spread over the whole ray, second half close around the last hit
+static IDirect3DQuery9* g_laserQ[2][kLaserProbes] = {};
+static int g_laserProbeState[2][kLaserProbes];      // -1 not issued (off screen), 1 issued
+static float g_laserProbeDist[2][kLaserProbes];
+static bool g_laserIssued[2] = { false, false };
+static int g_laserSet = 0;
+static bool g_laserQueriesOk = false, g_laserQueriesTried = false;
+static float g_laserHitD = -1.f;                    // world units along the ray, -1 = nothing hit
+static unsigned g_laserFrames = 0, g_laserHits = 0;
+static int g_laserDiag[4] = { 0, 0, 0, 0 };          // last read: issued, visible, hidden, not ready (log only)
+
+static void LaserRelease()
+{
+    for (int s = 0; s < 2; ++s) { for (int i = 0; i < kLaserProbes; ++i) if (g_laserQ[s][i]) { g_laserQ[s][i]->Release(); g_laserQ[s][i] = nullptr; } g_laserIssued[s] = false; }
+    g_laserQueriesOk = g_laserQueriesTried = false; g_laserHitD = -1.f;
+}
+
+struct LaserVertex { float x, y, z, rhw; DWORD color; };
+
+// Clip-space point -> pretransformed vertex in the viewport vp. False if behind the eye.
+static bool LaserScreen(const float c[4], const D3DVIEWPORT9& vp, float* sx, float* sy, float* sz, float* rhw)
+{
+    if (c[3] <= 1e-6f) return false;
+    const float iw = 1.f / c[3];
+    *sx = (float)vp.X + (c[0] * iw + 1.f) * 0.5f * (float)vp.Width;
+    *sy = (float)vp.Y + (1.f - c[1] * iw) * 0.5f * (float)vp.Height;
+    float z = c[2] * iw; if (z < 0.f) z = 0.f; if (z > 1.f) z = 1.f;
+    *sz = vp.MinZ + z * (vp.MaxZ - vp.MinZ); *rhw = iw;
+    return true;
+}
+
+static void VRDrawLaser(IDirect3DDevice9* dev)
+{
+    OwnRS ownRS;
+    if (g_laserDone) return;                                        // already drawn this frame, at the game's depth clear
+    if (!g_laserOn || !g_pickValid || !g_frameBestValid || !g_gameHwnd || !g_eyeParamsOk || !g_stereoSBS) return;
+    POINT p{}; RECT cr{};
+    if (!GetCursorPos(&p) || !ScreenToClient(g_gameHwnd, &p) || !GetClientRect(g_gameHwnd, &cr)) return;
+    const long cw = cr.right - cr.left, ch = cr.bottom - cr.top;
+    if (cw <= 0 || ch <= 0 || p.x < 0 || p.y < 0 || p.x >= cw || p.y >= ch) return;
+    float u, v; vrm::cursorUV(p.x, p.y, cw, ch, &u, &v);
+    if (g_hudBound) VRHudUnbind(dev);                                      // world target and its depth buffer
+    const int rtW = (int)(g_curRTw ? g_curRTw : g_bbW), rtH = (int)(g_curRTh ? g_curRTh : g_bbH);
+    if (rtW < 64 || rtH < 64) return;
+    if (!g_laserQueriesTried) {
+        g_laserQueriesTried = true;
+        g_laserQueriesOk = SUCCEEDED(dev->CreateQuery(D3DQUERYTYPE_OCCLUSION, nullptr));
+        for (int s = 0; s < 2 && g_laserQueriesOk; ++s) for (int i = 0; i < kLaserProbes; ++i)
+            if (FAILED(dev->CreateQuery(D3DQUERYTYPE_OCCLUSION, &g_laserQ[s][i])) || !g_laserQ[s][i]) { g_laserQueriesOk = false; break; }
+        Log("LASER: occlusion queries %s\n", g_laserQueriesOk ? "available, the beam ends where it hits the world" : "NOT available, the beam just goes 60 m out");
+    }
+
+    // The ray, in world units.
+    const vrm::V3 rc = vrm::pickRayCamera(u, v, g_pickFr);
+    float dir[3], O[3];
+    for (int c = 0; c < 3; ++c) { dir[c] = g_pickR[c] * rc.x + g_pickU[c] * rc.y + g_pickF[c] * rc.z; O[c] = g_pickPos[c]; }
+    // The two eyes' world view-projection matrices, exactly as this frame's world was drawn.
+    D3DMATRIX vp[2];
+    vrm::mul4(g_frameBestView.m, g_frameBestProj.m, vp[0].m);
+    float vR[4][4], pR[4][4], worst = 0.f;
+    const bool haveR = vrm::rightEyeMatrices(g_frameBestView.m, g_frameBestProj.m, g_eyeFrustum[0], g_eyeFrustum[1],
+        vrm::eyeOffsetCamera(g_eyeToHead[0]), vrm::eyeOffsetCamera(g_eyeToHead[1]), g_unitsPerMeter, vR, pR, &worst);
+    if (haveR) vrm::mul4(vR, pR, vp[1].m);
+    const float upm = g_unitsPerMeter;
+    float farU = g_lastFarUsed > 0.f ? g_lastFarUsed : 400.f * upm;
+    if (farU > 400.f * upm) farU = 400.f * upm;
+
+    // Read last frame's probes (non-blocking); keep the old hit while they are not ready.
+    const int prev = g_laserSet ^ 1;
+    if (g_laserQueriesOk && g_laserIssued[prev]) {
+        int st[kLaserProbes]; float dd[kLaserProbes]; int order[kLaserProbes]; bool ready = true;
+        for (int i = 0; i < kLaserProbes && ready; ++i) {
+            order[i] = i; dd[i] = g_laserProbeDist[prev][i];
+            if (g_laserProbeState[prev][i] < 0) { st[i] = -1; continue; }
+            DWORD n = 0; const HRESULT hr = g_laserQ[prev][i]->GetData(&n, sizeof(n), 0);
+            if (hr == S_OK) st[i] = n > 0 ? 1 : 0; else if (hr == S_FALSE) ready = false; else st[i] = -1;
+        }
+        g_laserDiag[3] = ready ? 0 : g_laserDiag[3] + 1;
+        if (ready) {
+            g_laserDiag[0] = g_laserDiag[1] = g_laserDiag[2] = 0;
+            for (int i = 0; i < kLaserProbes; ++i) if (st[i] >= 0) { ++g_laserDiag[0]; ++g_laserDiag[st[i] ? 1 : 2]; }
+            std::sort(order, order + kLaserProbes, [&](int a, int b) { return dd[a] < dd[b]; });
+            int ss[kLaserProbes]; float sd[kLaserProbes];
+            for (int i = 0; i < kLaserProbes; ++i) { ss[i] = st[order[i]]; sd[i] = dd[order[i]]; }
+            memcpy(st, ss, sizeof(st)); memcpy(dd, sd, sizeof(dd)); g_laserHitD = vrm::laserHitDistance(st, dd, kLaserProbes); g_laserIssued[prev] = false; if (g_laserHitD > 0.f) ++g_laserHits; }
+    }
+
+    // Save state.
+    static const D3DRENDERSTATETYPE kRS[] = { D3DRS_ZENABLE, D3DRS_ZWRITEENABLE, D3DRS_ZFUNC, D3DRS_ALPHABLENDENABLE, D3DRS_CULLMODE, D3DRS_LIGHTING,
+        D3DRS_ALPHATESTENABLE, D3DRS_STENCILENABLE, D3DRS_SCISSORTESTENABLE, D3DRS_FOGENABLE, D3DRS_COLORWRITEENABLE,
+        D3DRS_SEPARATEALPHABLENDENABLE, D3DRS_FILLMODE, D3DRS_SPECULARENABLE, D3DRS_CLIPPING };
+    constexpr int kN = (int)(sizeof(kRS) / sizeof(kRS[0]));
+    static const struct { DWORD stage; D3DTEXTURESTAGESTATETYPE type; DWORD val; } kTSS[] = {
+        { 0, D3DTSS_COLOROP, D3DTOP_SELECTARG1 }, { 0, D3DTSS_COLORARG1, D3DTA_DIFFUSE },
+        { 0, D3DTSS_ALPHAOP, D3DTOP_SELECTARG1 }, { 0, D3DTSS_ALPHAARG1, D3DTA_DIFFUSE }, { 1, D3DTSS_COLOROP, D3DTOP_DISABLE } };
+    constexpr int kT = (int)(sizeof(kTSS) / sizeof(kTSS[0]));
+    DWORD savedRS[kN], savedTSS[kT];
+    for (int i = 0; i < kN; ++i) { savedRS[i] = 0; dev->GetRenderState(kRS[i], &savedRS[i]); }
+    for (int i = 0; i < kT; ++i) { savedTSS[i] = 0; dev->GetTextureStageState(kTSS[i].stage, kTSS[i].type, &savedTSS[i]); }
+    IDirect3DBaseTexture9* tex0 = nullptr; dev->GetTexture(0, &tex0);
+    IDirect3DVertexDeclaration9* decl = nullptr; dev->GetVertexDeclaration(&decl);
+    IDirect3DVertexBuffer9* vb0 = nullptr; UINT vb0Off = 0, vb0Stride = 0; dev->GetStreamSource(0, &vb0, &vb0Off, &vb0Stride);
+    D3DVIEWPORT9 savedVP{}; dev->GetViewport(&savedVP);
+    IDirect3DVertexShader9* vs = nullptr; dev->GetVertexShader(&vs);
+    IDirect3DPixelShader9* ps = nullptr; dev->GetPixelShader(&ps);
+    RECT savedScissorRc{}; dev->GetScissorRect(&savedScissorRc);
+    IDirect3DSurface9* ds = nullptr; const bool haveDS = SUCCEEDED(dev->GetDepthStencilSurface(&ds)) && ds;
+    if (g_log && g_laserFrames == 0) {
+        D3DSURFACE_DESC dd{}, rd{}; IDirect3DSurface9* rt = nullptr;
+        if (ds) ds->GetDesc(&dd);
+        if (SUCCEEDED(dev->GetRenderTarget(0, &rt)) && rt) { rt->GetDesc(&rd); rt->Release(); }
+        Log("LASER: target %ux%u (ms %d), depth %s %ux%u fmt %d (ms %d)\n", rd.Width, rd.Height, (int)rd.MultiSampleType, haveDS ? "bound" : "NONE", dd.Width, dd.Height, (int)dd.Format, (int)dd.MultiSampleType);
+    }
+    if (ds) ds->Release();
+
+    dev->SetVertexShader(nullptr); dev->SetPixelShader(nullptr); dev->SetFVF(D3DFVF_XYZRHW | D3DFVF_DIFFUSE); dev->SetTexture(0, nullptr);
+    for (int i = 0; i < kT; ++i) dev->SetTextureStageState(kTSS[i].stage, kTSS[i].type, kTSS[i].val);
+    dev->SetRenderState(D3DRS_ZWRITEENABLE, FALSE); dev->SetRenderState(D3DRS_ZFUNC, D3DCMP_LESSEQUAL);
+    dev->SetRenderState(D3DRS_ALPHABLENDENABLE, FALSE); dev->SetRenderState(D3DRS_CULLMODE, D3DCULL_NONE);
+    dev->SetRenderState(D3DRS_LIGHTING, FALSE); dev->SetRenderState(D3DRS_ALPHATESTENABLE, FALSE);
+    dev->SetRenderState(D3DRS_STENCILENABLE, FALSE); dev->SetRenderState(D3DRS_FOGENABLE, FALSE);
+    dev->SetRenderState(D3DRS_SEPARATEALPHABLENDENABLE, FALSE); dev->SetRenderState(D3DRS_FILLMODE, D3DFILL_SOLID);
+    dev->SetRenderState(D3DRS_SPECULARENABLE, FALSE); dev->SetRenderState(D3DRS_SCISSORTESTENABLE, TRUE);
+
+    // Probes: left eye, invisible (no colour writes), depth-tested.
+    if (g_laserQueriesOk && haveDS) {
+        const int cur = g_laserSet;
+        int x, y, w, h; EyeRegion(0, rtW, rtH, &x, &y, &w, &h);
+        SetVP(dev, x, y, w, h);
+        D3DVIEWPORT9 evp{}; dev->GetViewport(&evp);
+        const RECT rc0 = { x, y, x + w, y + h }; g_origSetScissor(dev, &rc0);
+        dev->SetRenderState(D3DRS_ZENABLE, TRUE); dev->SetRenderState(D3DRS_COLORWRITEENABLE, 0);
+        const int half = kLaserProbes / 2;
+        const float dmin = 0.4f * upm;
+        float fineLo = 0.f, fineHi = 0.f;
+        if (g_laserHitD > 0.f) { fineLo = g_laserHitD * 0.8f; fineHi = g_laserHitD * 1.25f; if (fineLo < dmin) fineLo = dmin; if (fineHi > farU) fineHi = farU; }
+        for (int i = 0; i < kLaserProbes; ++i) {
+            float d;
+            if (i < half) d = vrm::laserProbeDistance(i, half, dmin, farU);
+            else if (fineHi > fineLo) d = fineLo + (fineHi - fineLo) * (float)(i - half) / (float)(half - 1);
+            else d = vrm::laserProbeDistance(i - half, half, dmin, farU) * std::pow(farU / dmin, 0.5f / (float)(half - 1));   // between the coarse ones
+            if (d > farU) d = farU;
+            g_laserProbeDist[cur][i] = d;
+            const float P[3] = { O[0] + dir[0] * d, O[1] + dir[1] * d, O[2] + dir[2] * d };
+            float c[4]; vrm::xformPoint(P, vp[0].m, c);
+            float sx, sy, sz, rhw;
+            g_laserProbeState[cur][i] = -1;
+            if (!LaserScreen(c, evp, &sx, &sy, &sz, &rhw)) continue;
+            if (sx < (float)x + 1.f || sy < (float)y + 1.f || sx > (float)(x + w) - 2.f || sy > (float)(y + h) - 2.f) continue;
+            const LaserVertex q[4] = { { sx - 1.f, sy - 1.f, sz, rhw, 0 }, { sx + 1.f, sy - 1.f, sz, rhw, 0 },
+                                       { sx - 1.f, sy + 1.f, sz, rhw, 0 }, { sx + 1.f, sy + 1.f, sz, rhw, 0 } };
+            g_laserQ[cur][i]->Issue(D3DISSUE_BEGIN);
+            g_origDrawPrimitiveUP(dev, D3DPT_TRIANGLESTRIP, 2, q, sizeof(LaserVertex));
+            g_laserQ[cur][i]->Issue(D3DISSUE_END);
+            g_laserProbeState[cur][i] = 1;
+        }
+        g_laserIssued[cur] = true;
+        g_laserSet ^= 1;
+    }
+
+    // Beam and dot, both eyes.
+    const float hitD = g_laserHitD > 0.f ? g_laserHitD : (60.f * upm < farU ? 60.f * upm : farU);
+    const float E[3] = { O[0] + dir[0] * hitD, O[1] + dir[1] * hitD, O[2] + dir[2] * hitD };
+    float H[3];
+    if (g_laserOrigin == 1) for (int c = 0; c < 3; ++c) H[c] = O[c] + dir[c] * 0.3f * upm;
+    else for (int c = 0; c < 3; ++c) H[c] = O[c] + upm * (0.18f * g_pickR[c] - 0.30f * g_pickU[c] + 0.25f * g_pickF[c]);
+    dev->SetRenderState(D3DRS_COLORWRITEENABLE, D3DCOLORWRITEENABLE_RED | D3DCOLORWRITEENABLE_GREEN | D3DCOLORWRITEENABLE_BLUE);
+    for (int eye = 0; eye < (haveR ? 2 : 1); ++eye) {
+        int x, y, w, h; EyeRegion(eye, rtW, rtH, &x, &y, &w, &h);
+        SetVP(dev, x, y, w, h);
+        D3DVIEWPORT9 evp{}; dev->GetViewport(&evp);
+        const RECT rc1 = { x, y, x + w, y + h }; g_origSetScissor(dev, &rc1);
+        float a[4], b[4]; vrm::xformPoint(H, vp[eye].m, a); vrm::xformPoint(E, vp[eye].m, b);
+        if (vrm::clipSegmentW(a, b, 1e-3f)) {
+            float ax, ay, az, aw, bx, by, bz, bw;
+            if (LaserScreen(a, evp, &ax, &ay, &az, &aw) && LaserScreen(b, evp, &bx, &by, &bz, &bw)) {
+                float nx = -(by - ay), ny = bx - ax; const float len = std::sqrt(nx * nx + ny * ny);
+                if (len > 0.5f) {
+                    dev->SetRenderState(D3DRS_ZENABLE, haveDS ? TRUE : FALSE);
+                    for (int pass = 0; pass < 2; ++pass) {                       // dark edge, then the bright core
+                        const float hw = (pass ? 0.5f : 1.0f) * g_laserPx; const DWORD col = pass ? 0xFFFF4040u : 0xFF400000u;
+                        const float ox = nx / len * hw, oy = ny / len * hw;
+                        const LaserVertex q[4] = { { ax - ox, ay - oy, az, aw, col }, { ax + ox, ay + oy, az, aw, col },
+                                                   { bx - ox, by - oy, bz, bw, col }, { bx + ox, by + oy, bz, bw, col } };
+                        g_origDrawPrimitiveUP(dev, D3DPT_TRIANGLESTRIP, 2, q, sizeof(LaserVertex));
+                    }
+                }
+            }
+        }
+        if (g_laserHitD > 0.f) {                                                  // the dot sits on the surface: always drawn
+            float c[4]; vrm::xformPoint(E, vp[eye].m, c);
+            float sx, sy, sz, rhw;
+            if (LaserScreen(c, evp, &sx, &sy, &sz, &rhw)) {
+                dev->SetRenderState(D3DRS_ZENABLE, FALSE);
+                for (int pass = 0; pass < 2; ++pass) {
+                    const float r = pass ? 2.2f * g_laserPx : 3.2f * g_laserPx; const DWORD col = pass ? 0xFFFF5050u : 0xFF200000u;
+                    LaserVertex fan[18]; fan[0] = { sx, sy, sz, rhw, col };
+                    for (int k = 0; k <= 16; ++k) { const float t = 6.2831853f * (float)k / 16.f; fan[k + 1] = { sx + r * std::cos(t), sy + r * std::sin(t), sz, rhw, col }; }
+                    g_origDrawPrimitiveUP(dev, D3DPT_TRIANGLEFAN, 16, fan, sizeof(LaserVertex));
+                }
+            }
+        }
+    }
+    ++g_laserFrames;
+    g_laserDone = true;
+    if (g_log && (g_laserFrames == 120 || g_laserFrames % (g_snapshotAt ? 50u : 1800u) == 0))   // more often in rig test runs
+        Log("LASER: %u frames, %u probe results with a hit; current hit %.1f m (%s), cursor at %.3f %.3f; probes issued %d visible %d hidden %d (not ready %d)\n", g_laserFrames, g_laserHits,
+            g_laserHitD > 0.f ? g_laserHitD / upm : -1.f, g_laserHitD > 0.f ? "surface" : "nothing hit, beam 60 m", u, v, g_laserDiag[0], g_laserDiag[1], g_laserDiag[2], g_laserDiag[3]);
+
+    g_origSetScissor(dev, &savedScissorRc);
+    for (int i = 0; i < kT; ++i) dev->SetTextureStageState(kTSS[i].stage, kTSS[i].type, savedTSS[i]);
+    for (int i = 0; i < kN; ++i) dev->SetRenderState(kRS[i], savedRS[i]);
+    dev->SetVertexDeclaration(decl); if (decl) decl->Release();
+    dev->SetStreamSource(0, vb0, vb0Off, vb0Stride); if (vb0) vb0->Release();
+    dev->SetVertexShader(vs); if (vs) vs->Release();
+    dev->SetPixelShader(ps); if (ps) ps->Release();
+    dev->SetTexture(0, tex0); if (tex0) tex0->Release();
+    g_origSetViewport(dev, &savedVP);
 }
 
 // End of frame, hud_anchor=world: draw the finished HUD texture as a flat panel per eye, fixed in the game's frame.
@@ -2348,6 +2600,7 @@ static void VRBeforePresent(IDirect3DDevice9* dev)
     if (!g_vrActive) return;
     if (g_wantRTW && !g_redirect) { UINT w = g_wantRTW, h = g_wantRTH; VRRedirectBeginFit(dev, &w, &h); }   // recreate after a device reset
     const double t0 = NowMs();
+    VRDrawLaser(dev);                         // in the world, before the HUD panel covers it
     VRDrawCursor(dev);
     VRCompositeHud(dev);                      // hud_anchor=world: the panel goes into the picture now, after everything else
     if (g_stereoSBS) {
@@ -2627,6 +2880,7 @@ static HRESULT WINAPI HookPresent(IDirect3DDevice9* self, const RECT* a, const R
         g_stats = Stats{};
     }
     if (g_vrWanted.load() || g_vrActive) { const int64_t tb = g_log ? PerfTick() : 0; VRBeforePresent(self); if (g_log && g_vrActive) g_pf[PF_BEFORE] += PerfTick() - tb; }
+    g_laserDone = false;
     HRESULT presentHr = D3D_OK;
     // While in VR the desktop window is not needed. Presenting to it costs a blit AND waits for the monitor's vertical
     // sync, and that wait then adds to the headset wait (two waits in series), so skip it (desktop_every=N shows every Nth frame).
@@ -2875,10 +3129,10 @@ static void OpenLogEarly()
 //     head=PAGEUP
 // Key names: A-Z, 0-9, F1-F24, NUMPAD0-9, NUMPAD_DIVIDE/MULTIPLY/SUBTRACT/ADD/DECIMAL, INSERT, DELETE,
 //            HOME, END, PAGEUP, PAGEDOWN, PAUSE, SCROLLLOCK.
-enum Action { ACT_CAPTURE, ACT_SCAN, ACT_RECENTER, ACT_TEST, ACT_HEAD, ACT_VR, ACT_SCALE_UP, ACT_SCALE_DOWN, ACT_CULL, ACT_HUD_NEAR, ACT_HUD_FAR, ACT_RECENTER2, ACT_POSITIONAL, ACT_RECENTER3, ACT_CURSOR, ACT_PITCHLOCK, ACT_HUD_STYLE, ACT_COUNT };
-static int g_keyVk[ACT_COUNT] = { 'C', 0 /*scan: unbound*/, 0 /*recenter: Numpad - now belongs to the pitch lock; recenter2/3 remain*/, VK_ADD, VK_INSERT, VK_MULTIPLY, VK_PRIOR, VK_NEXT, VK_HOME, VK_END, VK_DELETE, VK_DIVIDE, 'P', VK_OEM_2, 'M', VK_SUBTRACT, 'H' };
-static const char* kActionName[ACT_COUNT] = { "capture", "scan", "recenter", "test", "head", "vr", "scale_up", "scale_down", "cull", "hud_near", "hud_far", "recenter2", "positional", "recenter3", "cursor", "pitch_lock", "hud_cycle" };
-static const char* kActionDesc[ACT_COUNT] = { "capture one frame", "scan memory for camera", "recenter forward", "20-degree rotation test", "head tracking on monitor", "VR mode on/off", "world scale up", "world scale down", "culling follows head on/off", "HUD closer", "HUD farther", "recenter forward (alternate key)", "head position tracking on/off", "recenter forward (main-keyboard slash)", "VR mouse cursor on/off", "mouse pitch lock on/off (mouse no longer tilts the view; the headset does)", "HUD style: flat -> curved -> low" };
+enum Action { ACT_CAPTURE, ACT_SCAN, ACT_RECENTER, ACT_TEST, ACT_HEAD, ACT_VR, ACT_SCALE_UP, ACT_SCALE_DOWN, ACT_CULL, ACT_HUD_NEAR, ACT_HUD_FAR, ACT_RECENTER2, ACT_POSITIONAL, ACT_RECENTER3, ACT_CURSOR, ACT_PITCHLOCK, ACT_HUD_STYLE, ACT_LASER, ACT_COUNT };
+static int g_keyVk[ACT_COUNT] = { 'C', 0 /*scan: unbound*/, 0 /*recenter: Numpad - now belongs to the pitch lock; recenter2/3 remain*/, VK_ADD, VK_INSERT, VK_MULTIPLY, VK_PRIOR, VK_NEXT, VK_HOME, VK_END, VK_DELETE, VK_DIVIDE, 'P', VK_OEM_2, 'M', VK_SUBTRACT, 'H', 'L' };
+static const char* kActionName[ACT_COUNT] = { "capture", "scan", "recenter", "test", "head", "vr", "scale_up", "scale_down", "cull", "hud_near", "hud_far", "recenter2", "positional", "recenter3", "cursor", "pitch_lock", "hud_cycle", "laser" };
+static const char* kActionDesc[ACT_COUNT] = { "capture one frame", "scan memory for camera", "recenter forward", "20-degree rotation test", "head tracking on monitor", "VR mode on/off", "world scale up", "world scale down", "culling follows head on/off", "HUD closer", "HUD farther", "recenter forward (alternate key)", "head position tracking on/off", "recenter forward (main-keyboard slash)", "VR mouse cursor on/off", "mouse pitch lock on/off (mouse no longer tilts the view; the headset does)", "HUD style: flat -> curved -> low", "laser pointer on/off" };
 
 static int ParseKey(const char* n)
 {
@@ -2922,6 +3176,9 @@ static void LoadHotkeyConfig()
         if (_stricmp(line, "log") == 0) { Log("WARVR.ini: log -> on\n"); continue; }
         if (_stricmp(line, "water") == 0) { g_waterMode = _stricmp(val, "off") != 0; Log("WARVR.ini: water -> %s\n", g_waterMode ? "on (planar reflection rendered for both eyes)" : "off"); continue; }
         if (_stricmp(line, "cursor") == 0) { g_cursorOn = _stricmp(val, "off") != 0; Log("WARVR.ini: cursor -> %s\n", g_cursorOn ? "on" : "off"); continue; }
+        if (_stricmp(line, "laser") == 0) { g_laserOn = (_stricmp(val, "on") == 0 || _stricmp(val, "1") == 0); Log("WARVR.ini: laser -> %s\n", g_laserOn ? "on" : "off"); continue; }
+        if (_stricmp(line, "laser_origin") == 0) { g_laserOrigin = _stricmp(val, "eyes") == 0 || _stricmp(val, "head") == 0 ? 1 : 0; Log("WARVR.ini: laser_origin -> %s\n", g_laserOrigin ? "eyes" : "hand"); continue; }
+        if (_stricmp(line, "laser_width") == 0) { float v = (float)atof(val); if (v >= 1.f && v <= 20.f) g_laserPx = v; Log("WARVR.ini: laser_width -> %.1f px\n", g_laserPx); continue; }
         if (_stricmp(line, "cursor_size") == 0) { float v = (float)atof(val); if (v > 0.005f && v < 0.5f) g_cursorSize = v; Log("WARVR.ini: cursor_size -> %.3f\n", g_cursorSize); continue; }
         if (_stricmp(line, "vr_resolution") == 0) { g_resMode = _stricmp(val, "steamvr") == 0 ? 1 : (_stricmp(val, "desktop") == 0 ? 0 : 2); Log("WARVR.ini: vr_resolution -> %s\n", g_resMode == 1 ? "steamvr (always render at the size SteamVR recommends)" : (g_resMode == 0 ? "desktop (the game's own resolution)" : "auto (SteamVR's size when the GPU hand-off is available)")); continue; }
         if (_stricmp(line, "max_pixels") == 0) { g_maxPixels = atof(val) * 1e6; Log("WARVR.ini: max_pixels -> %.1f million (0 = no limit)\n", g_maxPixels / 1e6); continue; }
@@ -3026,6 +3283,10 @@ static void RunAction(Action a, const char* via)
         BeepAsync(a == ACT_HUD_NEAR ? 900 : 600, 60);
         Log("HUD distance = %.2f m (width %.2f m)\n", g_hudDistance, g_hudWidth);
         break;
+    case ACT_LASER: {
+        g_laserOn = !g_laserOn; BeepAsync(g_laserOn ? 1400 : 500, 120);
+        Log("laser pointer = %d\n", g_laserOn ? 1 : 0);
+        break; }
     case ACT_HUD_STYLE: {
         const int next = (g_hudStyle >= 2) ? 0 : g_hudStyle + 1;
         ApplyHudStyle(next); BeepAsync(700 + 300 * next, 80);
