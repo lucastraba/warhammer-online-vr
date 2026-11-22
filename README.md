@@ -2,6 +2,8 @@ Experimental VR mod for Warhammer Online: Age of Reckoning
 by Ross Scott
 
 ## About this fork
+The official project is Ross's: https://github.com/accursed-farms/warhammer-online-vr. This fork is only where changes get tested before they are offered back to it as a pull request.
+
 This fork adds a build for people who don't compile, plus two experimental options aimed at the CPU bottleneck. They stay off unless you turn them on, so with your usual dgVoodoo setup the mod works as before.
 
 -Download: the latest release on the Releases page of this fork (WARVR.dll, WARVRInjector.exe, openvr_api.dll, an example WARVR.ini). The files in bin\ below are the original build.
