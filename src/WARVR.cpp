@@ -1230,6 +1230,8 @@ struct CamTakeover {
 };
 static CamTakeover g_cam;
 static float g_drawDistScale = 1.0f;             // INI draw_distance: multiplies the main camera's far plane (1 = the game's own setting)
+static bool g_drawDistFlat = true;               // INI draw_distance_flat: also apply draw_distance when VR is off (on by default)
+static bool g_flatFarLogged = false;
 static float g_lastFarEngine = 0, g_lastFarUsed = 0;
 static CamTakeover g_camRefl;                    // the reflection camera object (planar water), same layout as the main camera
 static bool g_gameBasisValid = false;            // the game's own (unsteered) camera basis, as last passed to SetCamera for the main view
@@ -1290,7 +1292,7 @@ static void ComputeSteered(const Vec3f& pos, const Vec3f& right, const Vec3f& up
     if (g_pitchLock.load() && g_vrActive) vrm::levelBasis(right, up, fwd, &r0, &u0, &f0);       // remove the mouse's pitch, keep its heading
     vrm::rotateBasis(q, r0, u0, f0, &o->right, &o->up, &o->fwd);
     memcpy(o->fr, frustum, sizeof(o->fr));
-    if (g_vrActive && g_drawDistScale > 1.0001f && o->fr[5] > 1.f) { g_lastFarEngine = o->fr[5]; o->fr[5] *= g_drawDistScale; g_lastFarUsed = o->fr[5]; }
+    if ((g_vrActive || g_drawDistFlat) && g_drawDistScale > 1.0001f && o->fr[5] > 1.f) { g_lastFarEngine = o->fr[5]; o->fr[5] *= g_drawDistScale; g_lastFarUsed = o->fr[5]; }
     o->pos = pos;
     o->vr = false;
     if (g_vrActive && g_eyeParamsOk && !g_perturb.load()) {
@@ -1388,6 +1390,10 @@ static void WAR_THISCALL HookSetCamera(void* self, void* edx, const Vec3f* pos, 
     else {
         bool handled = false;
         const vrm::Mat3* q = ActiveRotation();
+        // Flat (VR off) with draw_distance: run the same camera path with no rotation, so only the far plane changes.
+        static const vrm::Mat3 kNoRotation = vrm::identity();
+        const bool flatFar = !q && !g_vrActive && g_drawDistFlat && g_drawDistScale > 1.0001f && g_rtIsMain;
+        if (flatFar) q = &kNoRotation;
         if (camObj && q && g_cullTakeover.load() && g_cam.verified >= 0 && !IsOnStack(frustum)) {
             uint8_t* cam = const_cast<uint8_t*>(reinterpret_cast<const uint8_t*>(frustum)) - 0xF0;
             Vec3f oPos = *pos, oFwd = *fwd, oUp = *up, oRight = *right;
@@ -1439,7 +1445,8 @@ static void WAR_THISCALL HookSetCamera(void* self, void* edx, const Vec3f* pos, 
                 g_cam.modified = true;
                 pp = &S.pos; pf = &S.fwd; pu = &S.up; pr = &S.right; pfr = S.fr;
                 g_outRing.add(S.right, S.up, S.fwd);
-                act = S.vr ? (g_vrEye ? "TAKEOVER+VR(R)" : "TAKEOVER+VR(L)") : "TAKEOVER";
+                act = S.vr ? (g_vrEye ? "TAKEOVER+VR(R)" : "TAKEOVER+VR(L)") : (flatFar ? "TAKEOVER-FLAT-FAR" : "TAKEOVER");
+                if (flatFar && !g_flatFarLogged) { g_flatFarLogged = true; Log("draw_distance (flat): main camera far plane %.0f -> %.0f\n", oFr[5], S.fr[5]); }
                 ++g_camTakeovers; ++g_setCameraRotated;
                 handled = true;
             } else act = "takeover-refused";
@@ -2863,6 +2870,7 @@ static void LoadHotkeyConfig()
         if (_stricmp(line, "lazy_state") == 0) { g_lazyState = _stricmp(val, "on") == 0 || _stricmp(val, "1") == 0; Log("WARVR.ini: lazy_state -> %s\n", g_lazyState ? "on (experimental)" : "off"); continue; }
         if (_stricmp(line, "vk_path") == 0) { g_vkPathWanted = _stricmp(val, "off") != 0; Log("WARVR.ini: vk_path -> %s\n", g_vkPathWanted ? "auto" : "off"); continue; }
         if (_stricmp(line, "desktop_every") == 0) { g_desktopEvery = (unsigned)atoi(val); Log("WARVR.ini: desktop_every -> %u\n", g_desktopEvery); continue; }
+        if (_stricmp(line, "draw_distance_flat") == 0) { g_drawDistFlat = !(_stricmp(val, "off") == 0 || _stricmp(val, "0") == 0); Log("WARVR.ini: draw_distance_flat -> %s\n", g_drawDistFlat ? "on (draw_distance also applies when VR is off)" : "off (VR only, the original behaviour)"); continue; }
         if (_stricmp(line, "draw_distance") == 0) { float v = (float)atof(val); if (v >= 1.0f && v <= 16.f) g_drawDistScale = v; Log("WARVR.ini: draw_distance -> x%.2f (far plane multiplier)\n", g_drawDistScale); continue; }
         if (_stricmp(line, "pitch_lock_start") == 0) { g_pitchLock = (_stricmp(val, "on") == 0 || _stricmp(val, "true") == 0 || _stricmp(val, "1") == 0); Log("WARVR.ini: pitch_lock_start -> %s\n", g_pitchLock.load() ? "on" : "off"); continue; }
         if (_stricmp(line, "log") == 0) { Log("WARVR.ini: log -> on\n"); continue; }

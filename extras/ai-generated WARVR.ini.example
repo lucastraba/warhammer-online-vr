@@ -9,6 +9,8 @@
 ; per-object distance, or hides the distance in fog, a bigger number shows nothing more. Start with 2.0 and look at a far horizon.
 ; (With log=on the report line "DRAW DISTANCE: ... game N -> used M" shows the far plane the game asked for and what was used.)
 ;draw_distance=1.0
+; It works without VR too (flat screen). draw_distance_flat=off limits it to VR mode, as in the original version.
+;draw_distance_flat=on
 
 ; ---------------------------------------------------------------- logging (phase 7f)
 ; Logging is OFF by default: no WARVR.log is written and the capture hotkey does nothing. To diagnose a problem set  log=on
