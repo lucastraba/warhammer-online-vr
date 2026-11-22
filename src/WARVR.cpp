@@ -1782,6 +1782,50 @@ static bool VRCaptureEye(IDirect3DDevice9* dev, int eye, const RECT* srcRect)
     return true;
 }
 
+// ---- vr_snapshot=N: save the picture the headset gets, once, after N submitted pairs ------------------------------
+// Reads the side-by-side VR target (or the back buffer) back through plain D3D9, so it works with every hand-off path
+// (CPU, GPU/dgVoodoo, VK/DXVK). Written at half size as a 24-bit BMP to %TEMP%\WARVR_vr_snapshot_<pair>.bmp.
+static unsigned g_snapshotAt = 0;
+static void VRSnapshot(IDirect3DDevice9* dev, unsigned pair)
+{
+    IDirect3DSurface9* src = nullptr;
+    if (g_redirect && g_vrRT) { src = g_vrRT; src->AddRef(); }
+    else if (FAILED(dev->GetBackBuffer(0, 0, D3DBACKBUFFER_TYPE_MONO, &src)) || !src) { Log("VR snapshot: no source surface\n"); return; }
+    D3DSURFACE_DESC d{}; src->GetDesc(&d);
+    IDirect3DSurface9* sys = nullptr;
+    HRESULT hr = dev->CreateOffscreenPlainSurface(d.Width, d.Height, d.Format, D3DPOOL_SYSTEMMEM, &sys, nullptr);
+    if (SUCCEEDED(hr)) hr = dev->GetRenderTargetData(src, sys);
+    src->Release();
+    D3DLOCKED_RECT lr{};
+    if (SUCCEEDED(hr)) hr = sys->LockRect(&lr, nullptr, D3DLOCK_READONLY);
+    if (FAILED(hr) || (d.Format != D3DFMT_A8R8G8B8 && d.Format != D3DFMT_X8R8G8B8)) {
+        Log("VR snapshot: readback failed hr=0x%08lX (format %d)\n", (unsigned long)hr, (int)d.Format);
+        if (sys) { if (SUCCEEDED(hr)) sys->UnlockRect(); sys->Release(); }
+        return;
+    }
+    const UINT w = d.Width / 2, h = d.Height / 2, row = (w * 3 + 3) & ~3u;
+    std::vector<uint8_t> img(size_t(row) * h);
+    for (UINT y = 0; y < h; ++y) {                                    // BMP rows go bottom-up; 2x2 box filter
+        const uint8_t* a = static_cast<const uint8_t*>(lr.pBits) + size_t(2 * y) * lr.Pitch;
+        const uint8_t* b = a + lr.Pitch;
+        uint8_t* o = img.data() + size_t(h - 1 - y) * row;
+        for (UINT x = 0; x < w; ++x)
+            for (int c = 0; c < 3; ++c)
+                o[x * 3 + c] = (uint8_t)((a[x * 8 + c] + a[x * 8 + 4 + c] + b[x * 8 + c] + b[x * 8 + 4 + c] + 2) / 4);
+    }
+    sys->UnlockRect(); sys->Release();
+    char path[MAX_PATH]; char tmp[MAX_PATH] = "."; GetTempPathA(MAX_PATH, tmp);
+    snprintf(path, sizeof(path), "%sWARVR_vr_snapshot_%u.bmp", tmp, pair);
+    FILE* f = fopen(path, "wb");
+    if (!f) { Log("VR snapshot: cannot write %s\n", path); return; }
+    const uint32_t dataSize = (uint32_t)img.size(), fileSize = 54 + dataSize;
+    uint8_t hd[54] = { 'B', 'M' };
+    auto put32 = [&](int at, uint32_t v) { hd[at] = (uint8_t)v; hd[at + 1] = (uint8_t)(v >> 8); hd[at + 2] = (uint8_t)(v >> 16); hd[at + 3] = (uint8_t)(v >> 24); };
+    put32(2, fileSize); put32(10, 54); put32(14, 40); put32(18, w); put32(22, h); hd[26] = 1; hd[28] = 24; put32(34, dataSize);
+    fwrite(hd, 1, 54, f); fwrite(img.data(), 1, img.size(), f); fclose(f);
+    Log("VR snapshot: %ux%u target saved at half size (%ux%u) to %s (left half = left eye)\n", d.Width, d.Height, w, h, path);
+}
+
 // ---- VR-sized render target ("vr_resolution=steamvr") ---------------------------------------------------------
 // The game draws into what it believes is its back buffer. We give it a render target + depth buffer of the size
 // SteamVR wants instead (both eyes side by side), and scale the viewports/clears/scissors it sets in ITS coordinates.
@@ -2313,6 +2357,7 @@ static void VRBeforePresent(IDirect3DDevice9* dev)
             static unsigned errLogs = 0;
             if (g_vrPairs < 5 || errLogs++ < 20) Log("VR: submit pair %u (%s) -> left err=%d right err=%d\n", g_vrPairs, vkDone ? "VK" : (g_gpuActive ? "GPU" : "CPU"), (int)e0, (int)e1);
         }
+        if (g_snapshotAt && g_vrPairs + 1 == g_snapshotAt) VRSnapshot(dev, g_vrPairs + 1);
         if (vkDone && (e0 || e1)) {
             if (++g_vkSubmitErrStreak >= 5) {           // SteamVR refuses the Vulkan images (e.g. missing extensions): use the CPU path
                 g_vkPathWanted = false; g_vkActive = false; g_vk.ReleaseCopy();
@@ -2813,6 +2858,7 @@ static void LoadHotkeyConfig()
         if (_stricmp(line, "eye_size") == 0) { g_eyeSizeCfg = (UINT)atoi(val); Log("WARVR.ini: eye_size -> %u\n", g_eyeSizeCfg); continue; }
         if (_stricmp(line, "positional") == 0) { g_positional = atoi(val) != 0; Log("WARVR.ini: positional -> %d\n", g_positional ? 1 : 0); continue; }
         if (_stricmp(line, "gpu_path") == 0) { g_gpuPathWanted = _stricmp(val, "off") != 0; Log("WARVR.ini: gpu_path -> %s\n", g_gpuPathWanted ? "auto" : "off"); continue; }
+        if (_stricmp(line, "vr_snapshot") == 0) { g_snapshotAt = (unsigned)atoi(val); Log("WARVR.ini: vr_snapshot -> %u\n", g_snapshotAt); continue; }
         if (_stricmp(line, "auto_vr") == 0) { g_autoVr = _stricmp(val, "on") == 0 || _stricmp(val, "1") == 0; Log("WARVR.ini: auto_vr -> %s\n", g_autoVr ? "on" : "off"); continue; }
         if (_stricmp(line, "lazy_state") == 0) { g_lazyState = _stricmp(val, "on") == 0 || _stricmp(val, "1") == 0; Log("WARVR.ini: lazy_state -> %s\n", g_lazyState ? "on (experimental)" : "off"); continue; }
         if (_stricmp(line, "vk_path") == 0) { g_vkPathWanted = _stricmp(val, "off") != 0; Log("WARVR.ini: vk_path -> %s\n", g_vkPathWanted ? "auto" : "off"); continue; }
