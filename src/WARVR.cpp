@@ -142,6 +142,10 @@ static SRWLOCK g_maskLock = SRWLOCK_INIT;
 static const ss::ConstMask* g_curVSMask = nullptr;   // masks of the shaders currently set (nullptr = unknown: patch everything)
 static const ss::ConstMask* g_curPSMask = nullptr;
 static unsigned g_shaderAnalysed[2] = {}, g_shaderRefused[2] = {}, g_patchesSkipped = 0;
+// Stutter diagnostics (log=on), per 300-frame report: the worst frame, frames over 50 ms, and the shaders the game
+// created in that time with how long the D3D9 layer took to create them (DXVK translates and compiles there).
+static double g_hitchWorstMs = 0, g_shaderCreateMs = 0, g_shaderCreateWorstMs = 0;
+static unsigned g_hitchCount = 0, g_shaderCreated = 0;
 static DWORD g_gameCW = 0xF;                     // the colour-write mask the GAME last asked for (the device may hold it with alpha masked off)
 static int g_ownRS = 0;                          // >0 while the mod's own passes run: their SetRenderState calls are not the game's
 struct OwnRS { OwnRS() { ++g_ownRS; } ~OwnRS() { --g_ownRS; } };
@@ -960,9 +964,22 @@ static HRESULT WINAPI HookDrawIndexedPrimitiveUP(IDirect3DDevice9* s, D3DPRIMITI
 static HRESULT WINAPI HookSetFVF(IDirect3DDevice9* s, DWORD fvf)
 { g_curFVF = fvf; return g_origSetFVF(s, fvf); }
 
+static double PerfMs(int64_t ticks)
+{
+    static const double qf = []{ LARGE_INTEGER f; QueryPerformanceFrequency(&f); return (double)f.QuadPart; }();
+    return (double)ticks * 1000.0 / qf;
+}
+static void NoteShaderCreate(int64_t t0)
+{
+    if (!g_log) return;
+    const double ms = PerfMs(PerfTick() - t0);
+    ++g_shaderCreated; g_shaderCreateMs += ms; if (ms > g_shaderCreateWorstMs) g_shaderCreateWorstMs = ms;
+}
 static HRESULT WINAPI HookCreateVertexShader(IDirect3DDevice9* s, const DWORD* fn, IDirect3DVertexShader9** pp)
 {
+    const int64_t t0 = PerfTick();
     const HRESULT hr = g_origCreateVS(s, fn, pp);
+    NoteShaderCreate(t0);
     if (SUCCEEDED(hr) && pp && *pp && fn) {
         ss::ConstMask m; const bool ok = ss::analyse(reinterpret_cast<const uint32_t*>(fn), 1u << 16, &m);
         AcquireSRWLockExclusive(&g_maskLock); g_vsMasks[(void*)*pp] = m; ReleaseSRWLockExclusive(&g_maskLock);
@@ -972,7 +989,9 @@ static HRESULT WINAPI HookCreateVertexShader(IDirect3DDevice9* s, const DWORD* f
 }
 static HRESULT WINAPI HookCreatePixelShader(IDirect3DDevice9* s, const DWORD* fn, IDirect3DPixelShader9** pp)
 {
+    const int64_t t0 = PerfTick();
     const HRESULT hr = g_origCreatePS(s, fn, pp);
+    NoteShaderCreate(t0);
     if (SUCCEEDED(hr) && pp && *pp && fn) {
         ss::ConstMask m; const bool ok = ss::analyse(reinterpret_cast<const uint32_t*>(fn), 1u << 16, &m);
         AcquireSRWLockExclusive(&g_maskLock); g_psMasks[(void*)*pp] = m; ReleaseSRWLockExclusive(&g_maskLock);
@@ -2773,6 +2792,11 @@ static HRESULT WINAPI HookPresent(IDirect3DDevice9* self, const RECT* a, const R
 {
     { static bool once = false; if (!once) { once = true; Log("THREAD: first Present on thread %lu\n", GetCurrentThreadId()); } }
     if (g_log) { static int64_t last = 0; const int64_t now = PerfTick(); if (g_vrActive && last) { g_pf[PF_FRAME] += now - last; ++g_pfFrames; } last = now; }
+    if (g_log) {
+        static int64_t last = 0; const int64_t now = PerfTick();
+        if (last) { const double ms = PerfMs(now - last); if (ms > g_hitchWorstMs) g_hitchWorstMs = ms; if (ms >= 50.0) ++g_hitchCount; }
+        last = now;
+    }
     LazyFlush(self);                            // our own drawing below, and the next frame, start from the game's state
     RestoreCamera();                            // give the game its own camera back before it updates it again
     ++g_frame;
@@ -2789,6 +2813,9 @@ static HRESULT WINAPI HookPresent(IDirect3DDevice9* self, const RECT* a, const R
     if (!g_probesDone && g_frame >= 180) { g_probesDone = true; RunProbes(self); }
     if ((g_frame % 300) == 0) {
         const Stats& s = g_stats;
+        Log("HITCHES frames %llu-%llu: worst frame %.1f ms, frames over 50 ms: %u | shaders the game created: %u, taking %.1f ms (worst %.1f ms) | in world: %s\n",
+            g_frame - 299, g_frame, g_hitchWorstMs, g_hitchCount, g_shaderCreated, g_shaderCreateMs, g_shaderCreateWorstMs, g_worldFrames > 0 ? "yes" : "no");
+        g_hitchWorstMs = 0; g_hitchCount = 0; g_shaderCreated = 0; g_shaderCreateMs = 0; g_shaderCreateWorstMs = 0;
         Log("FRAME %llu scenes=%u setXform=%u viewsRotated=%u | perspective draws: fixedfunc=%u shader=%u | ortho draws: fixedfunc=%u shader=%u | drawUP=%u | vsConstCalls=%u rtChanges=%u clears=%u | VS c0-c3 vs V*P: transposed=%u straight=%u none=%u patched=%u | head=%d\n",
             g_frame, s.scenes, s.setTransform, s.viewsRotated, s.drawPerspFFP, s.drawPerspVS, s.drawOrthoFFP, s.drawOrthoVS,
             s.drawUP, s.vsConstCalls, s.rtChanges, s.clears, s.vpMatchT, s.vpMatchN, s.vpNoMatch, s.vpPatched, g_headOn.load() ? 1 : 0);
