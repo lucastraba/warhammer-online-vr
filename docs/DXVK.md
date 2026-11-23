@@ -27,6 +27,13 @@ mod has to find dgVoodoo's private D3D11 device first (the "GPU path"), and fall
 
 Nothing else changes; `vk_path=auto` is the default. `vk_path=off` in WARVR.ini disables the hand-off.
 
+## Stutter in the first minutes
+
+Some stutter at the start, which then goes away, is DXVK compiling shaders the first time the game uses them, not the
+mod. It is usually less on later runs: DXVK 3 keeps a shader cache in `%LOCALAPPDATA%\dxvk`, and on drivers with
+`VK_EXT_graphics_pipeline_library` it compiles most shaders while the game loads. No log is needed for it. If it keeps
+coming back in the same places on every run, `DXVK_HUD=compiler` (an environment variable) shows when DXVK is compiling.
+
 ## Texture filtering
 
 WARVRConfig.exe can set this for you ("Texture filtering (DXVK)"), and the log switch below too.
