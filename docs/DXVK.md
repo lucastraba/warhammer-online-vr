@@ -1,10 +1,9 @@
 # Running WARVR on DXVK instead of dgVoodoo (experimental)
 
-**Status: runs in the game under Wine with a fake headset (`tools/fakevr`): VR on, every frame handed over as one
-VkImage with no copy, every submit accepted, correct stereo picture (checked with `vr_snapshot`). NOT yet tested
-with SteamVR or a real headset, and not on Windows.** Details: [tools/linux-rig/README.md](../tools/linux-rig/README.md).
-If you try it, please attach `%TEMP%\WARVR.log` (with `log=on`) to an issue on
-https://github.com/lucastraba/warhammer-online-vr/issues, whether it works or not.
+**Status: tested by Ross Scott on Windows with SteamVR and a headset (2026-11-22): 90 fps across the board, including
+the spots where dgVoodoo dropped frames, with GPU use up to about 80%.** Before that it was checked under Wine with a fake
+headset (`tools/fakevr`), see [tools/linux-rig/README.md](../tools/linux-rig/README.md). If something goes wrong, set
+`log=on` and send `%TEMP%\WARVR.log`.
 
 ## Why
 
@@ -27,6 +26,25 @@ mod has to find dgVoodoo's private D3D11 device first (the "GPU path"), and fall
    press `Ctrl+Shift+Numpad*`.
 
 Nothing else changes; `vk_path=auto` is the default. `vk_path=off` in WARVR.ini disables the hand-off.
+
+## Texture filtering
+
+dgVoodoo can force anisotropic filtering; DXVK doesn't by default, so distant textures can look softer. To force it, create
+a text file `dxvk.conf` next to `WAR.exe` (where DXVK's `d3d9.dll` is) containing:
+
+```
+d3d9.samplerAnisotropy = 16
+```
+
+DXVK reads it at startup (its own log shows `Found config file: dxvk.conf` and `d3d9.samplerAnisotropy = 16`).
+
+## DXVK's log file
+
+DXVK writes its own log, `WAR_d3d9.log`, next to `WAR.exe` every time. That one is DXVK's, not the mod's: `WARVR.log` (in
+`%TEMP%`) is still only written with `log=on`, as before, so the two never both appear unless you ask for the mod's log.
+DXVK's log can't be switched off from `WARVR.ini` or `dxvk.conf`; set the environment variable `DXVK_LOG_LEVEL=none` instead
+(for example `setx DXVK_LOG_LEVEL none` in a command prompt, then start the launcher again). Remove it if you ever need
+DXVK's log for a problem.
 
 ## What to look for in the log
 

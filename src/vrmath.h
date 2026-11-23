@@ -764,19 +764,23 @@ inline bool hudQuadEyeSpace(const V3& eyeOff, const Mat3& q, const V3& headPos, 
 //   curved = false: a flat rectangle widthM wide at `distance` (the original panel).
 //   curved = true : a strip of a cylinder around the head with radius `distance`, spanning the same angle as the flat
 //                   panel would (so switching it on keeps the HUD's size and only bends it). Every column of the HUD is
-//                   then the same distance away and faces you, so the edges are as readable as the middle.
+//                   then the same distance away and faces you, so the edges are as readable as the middle. Its height
+//                   is scaled to the arc's length, so the UI keeps its proportions (bending a strip of the full flat
+//                   height would make everything look stretched upwards, by ~19% with the default 2.4 m at 1.5 m).
 //   tiltDeg       : leans the panel back about its horizontal centre line (top farther away), so a panel placed below
 //                   eye level (vertM < 0) faces a downward glance. 0 = upright.
 //   yaw           : turns the whole panel about the vertical axis through the head (radians, + = to the right).
 inline V3 hudPanelPoint(float u, float v, float distance, float widthM, float uiAspect, float vertM, bool curved,
                         float tiltDeg, float yaw) {
-    const float hh = widthM / uiAspect * 0.5f;
+    float hh = widthM / uiAspect * 0.5f;
+    const float half = std::atan(widthM * 0.5f / distance);
+    if (curved && half > 1e-4f) hh *= 2.f * half * distance / widthM;     // arc length / flat width
     const float yl = hh - v * 2.f * hh;
     const float t = tiltDeg * 3.14159265f / 180.f;
     const float dy = yl * std::cos(t), dz = yl * std::sin(t);
     float x, z;
     if (curved) {
-        const float half = std::atan(widthM * 0.5f / distance), th = (u - 0.5f) * 2.f * half, r = distance + dz;
+        const float th = (u - 0.5f) * 2.f * half, r = distance + dz;
         x = r * std::sin(th); z = r * std::cos(th);
     }
     else { x = (u - 0.5f) * widthM; z = distance + dz; }

@@ -702,6 +702,15 @@ int main() {
         const V3 fL = hudPanelPoint(0.f, 0.5f, 1.5f, 2.4f, 16.f / 9.f, 0.f, false, 0.f, 0.f);
         printf("left edge angle: curved %.2f deg, flat %.2f deg\n", std::atan2(eL.x, eL.z) * 57.29578f, std::atan2(fL.x, fL.z) * 57.29578f);
         CHECK(std::fabs(std::atan2(eL.x, eL.z) - std::atan2(fL.x, fL.z)) < 1e-4f);
+        {   // curved keeps the UI's proportions: arc length / height = the UI's aspect (no vertical stretch)
+            const V3 cT = hudPanelPoint(0.5f, 0.f, 1.5f, 2.4f, 16.f / 9.f, 0.f, true, 0.f, 0.f);
+            const V3 cB = hudPanelPoint(0.5f, 1.f, 1.5f, 2.4f, 16.f / 9.f, 0.f, true, 0.f, 0.f);
+            const float arc = 2.f * std::atan(1.2f / 1.5f) * 1.5f, height = cT.y - cB.y;
+            printf("curved HUD: arc %.4f m, height %.4f m, aspect %.4f (UI 1.7778)\n", arc, height, arc / height);
+            CHECK(std::fabs(arc / height - 16.f / 9.f) < 1e-3f);
+            const V3 fT = hudPanelPoint(0.5f, 0.f, 1.5f, 2.4f, 16.f / 9.f, 0.f, false, 0.f, 0.f);
+            CHECK(std::fabs(fT.y - 2.4f / (16.f / 9.f) * 0.5f) < 1e-5f);      // flat unchanged
+        }
         // tilt: top leans back, bottom comes forward; the centre line stays
         const V3 top = hudPanelPoint(0.5f, 0.f, 1.5f, 2.4f, 16.f / 9.f, -0.3f, false, 20.f, 0.f);
         const V3 bot = hudPanelPoint(0.5f, 1.f, 1.5f, 2.4f, 16.f / 9.f, -0.3f, false, 20.f, 0.f);
