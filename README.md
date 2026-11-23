@@ -2,26 +2,7 @@ Experimental VR mod for Warhammer Online: Age of Reckoning
 by Ross Scott
 
 ## About this fork
-The official project is Ross's: https://github.com/accursed-farms/warhammer-online-vr. This fork is only where changes get tested before they are offered back to it as a pull request.
-
-This fork adds a build for people who don't compile, plus two experimental options aimed at the CPU bottleneck. They stay off unless you turn them on, so with your usual dgVoodoo setup the mod works as before.
-
--Download: the latest release on the Releases page of this fork (WARVR.dll, WARVRInjector.exe, WARVRConfig.exe, openvr_api.dll, an example WARVR.ini). The files in bin\ below are the original build.
-
--lazy_state=on in WARVR.ini (with dgVoodoo): skips some of the extra work the mod does for every object.
-
--DXVK instead of dgVoodoo: see docs\DXVK.md.
-
--HUD shape: Ctrl+Shift+H switches the HUD between flat (as before), curved (bent around you, so the minimap and chat at the edges face you) and low (curved, lower and leaned back, a glance down). hud_style=flat|curved|low in WARVR.ini picks the one it starts with.
--Laser pointer: Ctrl+Shift+L (or laser=on in WARVR.ini) draws a red beam along the line the game itself uses for the mouse, ending in a dot on whatever the cursor is really pointing at, so you no longer have to wait for something to highlight. laser_origin=hand|eyes picks where the beam starts (hand: low and to the right; eyes: straight out from your view, only the dot shows), laser_width=3 sets its width in pixels. VR only.
-
--draw_distance now also works without VR (flat screen).
-
--Settings window: WARVRConfig.exe (next to the injector) sets the main options without editing WARVR.ini by hand: VR on when you enter the world, HUD style, laser, draw distance, lazy_state, the log, DXVK texture filtering and DXVK's own log. It only changes the lines it owns, so a hand-edited WARVR.ini keeps everything else. It can also set the time of day on your own ProjectWAR server, after a two-line server change (docs\SERVER_TIME.md).
-
--Tested only under Wine on Linux with a fake headset (tools\fakevr, tools\linux-rig), not yet on Windows or with a real headset. Like the original, written with Claude.
-
--Problems or logs (%TEMP%\WARVR.log): open an issue on this fork.
+The mod is now maintained in Ross's repository, with his permission: https://github.com/accursed-farms/warhammer-online-vr. Downloads, updates and issues are there. This fork is Lucas's workshop: it also holds the Linux test setup (tools\linux-rig) and is where changes are tried before they go there.
 
 ## Description:
 This mod will activate full 3D VR rendering when inside Warhammer Online and should scale to any resolution.
