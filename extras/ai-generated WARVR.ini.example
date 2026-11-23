@@ -107,6 +107,20 @@
 ;hud_follow=off
 ;hud_follow_deg=50
 
+; Split HUD (experimental, VR only; Ctrl+Shift+J toggles it while you play): the minimap, your portrait and bars, and the
+; chat are cut out of the board and shown on their own small panels around you, facing you, so they are bigger and easier
+; to read at a glance. Everything else (action bars, windows you open) stays on the board. The pieces are read-only for
+; now: the mouse still works on the board, so click the minimap or chat where they were before.
+;hud_split=on
+; The pieces match WAR's default layout. If you moved windows, set your own (the first hud_piece line replaces them all):
+;   hud_piece=<name>,<left>,<top>,<right>,<bottom>,<yaw>,<pitch>,<distance>,<width>
+; left/top/right/bottom: the rectangle in percent of the game's screen. yaw: degrees to the right (negative = left).
+; pitch: degrees up (negative = down). distance and width in metres. The defaults are:
+;hud_piece=minimap,87,4.5,100,27.5,28,-6,1.0,0.32
+;hud_piece=player,0,0,26,11.5,-20,-22,1.0,0.46
+;hud_piece=chat,0,71.5,19.5,100,-32,-8,1.0,0.50
+; To find the rectangles: log=on and vr_snapshot=100 save %TEMP%\WARVR_hud_100.bmp, the UI as the game drew it.
+
 ; ---------------------------------------------------------------- hotkeys (Ctrl+Shift + key). Defaults shown.
 ;vr=NUMPAD_MULTIPLY
 ;recenter=                  (unbound by default; Numpad - is now the mouse pitch lock)

@@ -269,6 +269,13 @@ static float g_hudFollowDeg = 50.f;                // ...once your heading is th
 static float g_hudYaw = 0.f;                       // current panel heading (radians, + = right), lazy follow only
 static bool g_hudFollowing = false;
 static float g_hudVertUser = 0.0f;                 // hud_vertical as set in WARVR.ini; "low" sits 0.35 m below it
+// Split HUD (hud_split=on, Ctrl+Shift+J): parts of the UI are cut out of the board and shown on their own small panels around
+// you. Rectangles are fractions of the UI picture, matched to WAR's default layout; hud_piece= lines in WARVR.ini replace them.
+static bool g_hudSplit = false;
+struct HudPieceCfg { char name[24]; vrm::HudPiece p; };
+static HudPieceCfg g_hudPieces[16];                // DefaultHudPieces() fills it unless WARVR.ini has hud_piece lines
+static int g_hudPieceCount = 0;
+static bool g_hudPiecesFromIni = false;
 static const char* HudStyleName(int s) { return s == 0 ? "flat" : s == 1 ? "curved" : s == 2 ? "low" : "custom"; }
 static void ApplyHudStyle(int st)
 {
@@ -1859,8 +1866,43 @@ static bool VRCaptureEye(IDirect3DDevice9* dev, int eye, const RECT* srcRect)
 static unsigned g_snapshotAt = 0;
 static unsigned g_snapshotCount = 1;               // vr_snapshot=N,K: K snapshots, N pairs apart
 static bool g_snapshotHudCycle = false;            // vr_snapshot_hud_cycle=on: next HUD style after each snapshot (rig testing)
+static bool g_snapshotSplitCycle = false;          // vr_snapshot_hud_cycle=split: split HUD on/off after each snapshot (rig testing)
 static void ApplyHudStyle(int st);
 static const char* HudStyleName(int s);
+// The HUD picture itself (the whole UI as the game drew it), over dark grey, at half size: WARVR_hud_<pair>.bmp.
+// Useful for finding the rectangles of hud_piece= lines.
+static void VRSnapshotHud(IDirect3DDevice9* dev, unsigned pair)
+{
+    D3DSURFACE_DESC d{}; g_hudSurf->GetDesc(&d);
+    IDirect3DSurface9* sys = nullptr;
+    HRESULT hr = dev->CreateOffscreenPlainSurface(d.Width, d.Height, d.Format, D3DPOOL_SYSTEMMEM, &sys, nullptr);
+    if (SUCCEEDED(hr)) hr = dev->GetRenderTargetData(g_hudSurf, sys);
+    D3DLOCKED_RECT lr{};
+    if (SUCCEEDED(hr)) hr = sys->LockRect(&lr, nullptr, D3DLOCK_READONLY);
+    if (FAILED(hr)) { Log("HUD snapshot: readback failed hr=0x%08lX\n", (unsigned long)hr); if (sys) sys->Release(); return; }
+    const UINT w = d.Width / 2, h = d.Height / 2, row = (w * 3 + 3) & ~3u;
+    std::vector<uint8_t> img(size_t(row) * h);
+    for (UINT y = 0; y < h; ++y) {
+        const uint8_t* a = static_cast<const uint8_t*>(lr.pBits) + size_t(2 * y) * lr.Pitch;
+        uint8_t* o = img.data() + size_t(h - 1 - y) * row;
+        for (UINT x = 0; x < w; ++x) {
+            const uint8_t* px = a + x * 8;
+            const int al = px[3];
+            for (int c = 0; c < 3; ++c) { const int v = px[c] + (255 - al) * 48 / 255; o[x * 3 + c] = (uint8_t)(v > 255 ? 255 : v); }
+        }
+    }
+    sys->UnlockRect(); sys->Release();
+    char path[MAX_PATH]; char tmp[MAX_PATH] = "."; GetTempPathA(MAX_PATH, tmp);
+    snprintf(path, sizeof(path), "%sWARVR_hud_%u.bmp", tmp, pair);
+    FILE* f = fopen(path, "wb");
+    if (!f) return;
+    const uint32_t dataSize = (uint32_t)img.size(), fileSize = 54 + dataSize;
+    uint8_t hd[54] = { 'B', 'M' };
+    auto put32 = [&](int at, uint32_t v) { hd[at] = (uint8_t)v; hd[at + 1] = (uint8_t)(v >> 8); hd[at + 2] = (uint8_t)(v >> 16); hd[at + 3] = (uint8_t)(v >> 24); };
+    put32(2, fileSize); put32(10, 54); put32(14, 40); put32(18, w); put32(22, h); hd[26] = 1; hd[28] = 24; put32(34, dataSize);
+    fwrite(hd, 1, 54, f); fwrite(img.data(), 1, img.size(), f); fclose(f);
+    Log("HUD snapshot: %ux%u HUD picture saved at half size to %s\n", d.Width, d.Height, path);
+}
 static void VRSnapshot(IDirect3DDevice9* dev, unsigned pair)
 {
     IDirect3DSurface9* src = nullptr;
@@ -1899,6 +1941,7 @@ static void VRSnapshot(IDirect3DDevice9* dev, unsigned pair)
     put32(2, fileSize); put32(10, 54); put32(14, 40); put32(18, w); put32(22, h); hd[26] = 1; hd[28] = 24; put32(34, dataSize);
     fwrite(hd, 1, 54, f); fwrite(img.data(), 1, img.size(), f); fclose(f);
     Log("VR snapshot: %ux%u target saved at half size (%ux%u) to %s (left half = left eye)\n", d.Width, d.Height, w, h, path);
+    if (g_hudSurf) VRSnapshotHud(dev, pair);
 }
 
 // ---- VR-sized render target ("vr_resolution=steamvr") ---------------------------------------------------------
@@ -2307,6 +2350,55 @@ static void VRDrawLaser(IDirect3DDevice9* dev)
 
 // End of frame, hud_anchor=world: draw the finished HUD texture as a flat panel per eye, fixed in the game's frame.
 struct HudVertex { float x, y, z, u, v; };
+static void SetVP(IDirect3DDevice9* dev, int x, int y, int w, int h);
+
+// Split HUD: the board minus the pieces (as rectangles of the same panel surface), then each piece on its own small panel
+// facing you, drawn last so it sits over the board where they overlap. Called with the HUD states already set.
+static void VRCompositeSplitHud(IDirect3DDevice9* dev, float uiAspect, const vrm::Mat3& q, const vrm::V3& hp, int rtW, int rtH)
+{
+    vrm::HudPiece pc[16];
+    const int np = std::min(g_hudPieceCount, 16);
+    for (int i = 0; i < np; ++i) pc[i] = g_hudPieces[i].p;
+    float cells[256][4];
+    const int nc = vrm::hudBoardCells(pc, np, cells, 256);
+    static std::vector<HudVertex> tri;
+    for (int eye = 0; eye < 2; ++eye) {
+        const vrm::V3 eo = vrm::eyeOffsetCamera(g_eyeToHead[eye]);
+        tri.clear();
+        bool any = false;
+        auto put = [&](const vrm::V3& pt, float u, float v) {
+            float e[3]; vrm::hudPointToEye(pt, eo, q, hp, e);
+            if (e[2] > 0.05f) any = true;
+            tri.push_back({ e[0], e[1], e[2], u, v });
+        };
+        for (int c = 0; c < nc; ++c) {
+            const float u0 = cells[c][0], v0 = cells[c][1], u1 = cells[c][2], v1 = cells[c][3];
+            const int segs = g_hudCurve ? std::max(1, (int)std::ceil((u1 - u0) * 32.f)) : 1;
+            for (int s = 0; s < segs; ++s) {
+                const float a = u0 + (u1 - u0) * s / segs, b = u0 + (u1 - u0) * (s + 1) / segs;
+                auto P = [&](float u, float v) { return vrm::hudPanelPoint(u, v, g_hudDistance, g_hudWidth, uiAspect, g_hudVert, g_hudCurve, g_hudTilt, g_hudYaw); };
+                put(P(a, v0), a, v0); put(P(b, v0), b, v0); put(P(a, v1), a, v1);
+                put(P(b, v0), b, v0); put(P(b, v1), b, v1); put(P(a, v1), a, v1);
+            }
+        }
+        for (int i = 0; i < np; ++i) {
+            const vrm::HudPiece& p = pc[i];
+            auto P = [&](float s, float t) { return vrm::hudPiecePoint(p, s, t, uiAspect, g_hudYaw); };
+            put(P(0, 0), p.u0, p.v0); put(P(1, 0), p.u1, p.v0); put(P(0, 1), p.u0, p.v1);
+            put(P(1, 0), p.u1, p.v0); put(P(1, 1), p.u1, p.v1); put(P(0, 1), p.u0, p.v1);
+        }
+        if (!any || tri.empty()) continue;
+        int x, y, w, h; EyeRegion(eye, rtW, rtH, &x, &y, &w, &h);
+        SetVP(dev, x, y, w, h);
+        float pm[4][4];
+        vrm::perspFromFrustum(g_eyeFrustum[eye][0], g_eyeFrustum[eye][1], g_eyeFrustum[eye][2], g_eyeFrustum[eye][3], 0.05f, 100.f, pm);
+        D3DMATRIX proj; memcpy(&proj, pm, sizeof(proj));
+        g_origSetTransform(dev, D3DTS_PROJECTION, &proj);
+        g_origDrawPrimitiveUP(dev, D3DPT_TRIANGLELIST, (UINT)(tri.size() / 3), tri.data(), sizeof(HudVertex));
+    }
+    static bool logged = false;
+    if (!logged) { logged = true; Log("split HUD: %d pieces, the board drawn as %d rectangles\n", np, nc); }
+}
 static void VRCompositeHud(IDirect3DDevice9* dev)
 {
     OwnRS ownRS;                              // our SetRenderState calls are not the game's
@@ -2367,7 +2459,8 @@ static void VRCompositeHud(IDirect3DDevice9* dev)
     // The panel as a strip of quads: one column for a flat untilted panel, 32 when it is curved.
     const int cols = g_hudCurve ? 32 : 1;
     HudVertex mesh[2 * 33];
-    for (int eye = 0; eye < 2; ++eye) {
+    if (g_hudSplit && g_hudPieceCount > 0) VRCompositeSplitHud(dev, uiAspect, q, hp, rtW, rtH);
+    else for (int eye = 0; eye < 2; ++eye) {
         const vrm::V3 eo = vrm::eyeOffsetCamera(g_eyeToHead[eye]);
         bool any = false;
         for (int i = 0; i <= cols; ++i) for (int r = 0; r < 2; ++r) {
@@ -2681,6 +2774,7 @@ static void VRBeforePresent(IDirect3DDevice9* dev)
         if (g_snapshotAt && (g_vrPairs + 1) % g_snapshotAt == 0 && (g_vrPairs + 1) / g_snapshotAt <= g_snapshotCount) {
             VRSnapshot(dev, g_vrPairs + 1);
             if (g_snapshotHudCycle) { ApplyHudStyle(g_hudStyle >= 2 ? 0 : g_hudStyle + 1); Log("vr_snapshot: HUD style now %s\n", HudStyleName(g_hudStyle)); }
+            if (g_snapshotSplitCycle) { g_hudSplit = !g_hudSplit; Log("vr_snapshot: split HUD now %s\n", g_hudSplit ? "on" : "off"); }
         }
         if (vkDone && (e0 || e1)) {
             if (++g_vkSubmitErrStreak >= 5) {           // SteamVR refuses the Vulkan images (e.g. missing extensions): use the CPU path
@@ -3156,10 +3250,10 @@ static void OpenLogEarly()
 //     head=PAGEUP
 // Key names: A-Z, 0-9, F1-F24, NUMPAD0-9, NUMPAD_DIVIDE/MULTIPLY/SUBTRACT/ADD/DECIMAL, INSERT, DELETE,
 //            HOME, END, PAGEUP, PAGEDOWN, PAUSE, SCROLLLOCK.
-enum Action { ACT_CAPTURE, ACT_SCAN, ACT_RECENTER, ACT_TEST, ACT_HEAD, ACT_VR, ACT_SCALE_UP, ACT_SCALE_DOWN, ACT_CULL, ACT_HUD_NEAR, ACT_HUD_FAR, ACT_RECENTER2, ACT_POSITIONAL, ACT_RECENTER3, ACT_CURSOR, ACT_PITCHLOCK, ACT_HUD_STYLE, ACT_LASER, ACT_COUNT };
-static int g_keyVk[ACT_COUNT] = { 'C', 0 /*scan: unbound*/, 0 /*recenter: Numpad - now belongs to the pitch lock; recenter2/3 remain*/, VK_ADD, VK_INSERT, VK_MULTIPLY, VK_PRIOR, VK_NEXT, VK_HOME, VK_END, VK_DELETE, VK_DIVIDE, 'P', VK_OEM_2, 'M', VK_SUBTRACT, 'H', 'L' };
-static const char* kActionName[ACT_COUNT] = { "capture", "scan", "recenter", "test", "head", "vr", "scale_up", "scale_down", "cull", "hud_near", "hud_far", "recenter2", "positional", "recenter3", "cursor", "pitch_lock", "hud_cycle", "laser" };
-static const char* kActionDesc[ACT_COUNT] = { "capture one frame", "scan memory for camera", "recenter forward", "20-degree rotation test", "head tracking on monitor", "VR mode on/off", "world scale up", "world scale down", "culling follows head on/off", "HUD closer", "HUD farther", "recenter forward (alternate key)", "head position tracking on/off", "recenter forward (main-keyboard slash)", "VR mouse cursor on/off", "mouse pitch lock on/off (mouse no longer tilts the view; the headset does)", "HUD style: flat -> curved -> low", "laser pointer on/off" };
+enum Action { ACT_CAPTURE, ACT_SCAN, ACT_RECENTER, ACT_TEST, ACT_HEAD, ACT_VR, ACT_SCALE_UP, ACT_SCALE_DOWN, ACT_CULL, ACT_HUD_NEAR, ACT_HUD_FAR, ACT_RECENTER2, ACT_POSITIONAL, ACT_RECENTER3, ACT_CURSOR, ACT_PITCHLOCK, ACT_HUD_STYLE, ACT_LASER, ACT_HUD_SPLIT, ACT_COUNT };
+static int g_keyVk[ACT_COUNT] = { 'C', 0 /*scan: unbound*/, 0 /*recenter: Numpad - now belongs to the pitch lock; recenter2/3 remain*/, VK_ADD, VK_INSERT, VK_MULTIPLY, VK_PRIOR, VK_NEXT, VK_HOME, VK_END, VK_DELETE, VK_DIVIDE, 'P', VK_OEM_2, 'M', VK_SUBTRACT, 'H', 'L', 'J' };
+static const char* kActionName[ACT_COUNT] = { "capture", "scan", "recenter", "test", "head", "vr", "scale_up", "scale_down", "cull", "hud_near", "hud_far", "recenter2", "positional", "recenter3", "cursor", "pitch_lock", "hud_cycle", "laser", "hud_split_key" };
+static const char* kActionDesc[ACT_COUNT] = { "capture one frame", "scan memory for camera", "recenter forward", "20-degree rotation test", "head tracking on monitor", "VR mode on/off", "world scale up", "world scale down", "culling follows head on/off", "HUD closer", "HUD farther", "recenter forward (alternate key)", "head position tracking on/off", "recenter forward (main-keyboard slash)", "VR mouse cursor on/off", "mouse pitch lock on/off (mouse no longer tilts the view; the headset does)", "HUD style: flat -> curved -> low", "laser pointer on/off", "split HUD on/off (minimap, unit frames, chat on their own panels)" };
 
 static int ParseKey(const char* n)
 {
@@ -3176,8 +3270,40 @@ static int ParseKey(const char* n)
     return 0;
 }
 
+// hud_piece=<name>,<left>,<top>,<right>,<bottom>,<yaw>,<pitch>,<distance>,<width>
+// left/top/right/bottom in percent of the UI picture; yaw (+ = right) and pitch (+ = up) in degrees; distance and width in
+// metres. The first hud_piece line replaces the built-in pieces.
+static void ParseHudPiece(const char* val)
+{
+    char name[24] = {}; float f[8] = {};
+    const char* c = strchr(val, ',');
+    if (!c || c - val >= (ptrdiff_t)sizeof(name)) { Log("WARVR.ini: hud_piece '%s' not understood\n", val); return; }
+    memcpy(name, val, c - val);
+    int k = 0;
+    while (c && k < 8) { f[k++] = (float)atof(c + 1); c = strchr(c + 1, ','); }
+    if (k < 8 || f[2] <= f[0] || f[3] <= f[1] || f[6] < 0.2f || f[7] < 0.02f) { Log("WARVR.ini: hud_piece '%s' needs name,left,top,right,bottom,yaw,pitch,distance,width (percent, degrees, metres)\n", val); return; }
+    if (!g_hudPiecesFromIni) { g_hudPieceCount = 0; g_hudPiecesFromIni = true; }
+    if (g_hudPieceCount >= 16) return;
+    HudPieceCfg& h = g_hudPieces[g_hudPieceCount++];
+    memcpy(h.name, name, sizeof(name));
+    h.p = { f[0] / 100.f, f[1] / 100.f, f[2] / 100.f, f[3] / 100.f, f[4], f[5], f[6], f[7] };
+    Log("WARVR.ini: hud_piece %s -> %.1f,%.1f..%.1f,%.1f %% at yaw %.0f pitch %.0f, %.2f m away, %.2f m wide\n", h.name, f[0], f[1], f[2], f[3], f[4], f[5], f[6], f[7]);
+}
+static void DefaultHudPieces()
+{
+    static const HudPieceCfg kDefault[] = {
+        // name          left    top    right  bottom    yaw   pitch  dist   width
+        { "minimap",   { 0.870f, 0.045f, 1.000f, 0.275f,  28.f,  -6.f, 1.00f, 0.32f } },   // to your right, a glance away
+        { "player",    { 0.000f, 0.000f, 0.260f, 0.115f, -20.f, -22.f, 1.00f, 0.46f } },   // your portrait and bars, low left near the action bar
+        { "chat",      { 0.000f, 0.715f, 0.195f, 1.000f, -32.f,  -8.f, 1.00f, 0.50f } },   // to your left, bigger than on the board
+    };
+    g_hudPieceCount = (int)(sizeof(kDefault) / sizeof(kDefault[0]));
+    for (int i = 0; i < g_hudPieceCount; ++i) g_hudPieces[i] = kDefault[i];
+}
+
 static void LoadHotkeyConfig()
 {
+    if (!g_hudPiecesFromIni && g_hudPieceCount == 0) DefaultHudPieces();
     std::string path = ModuleDir() + "\\WARVR.ini";
     FILE* f = nullptr;
     if (fopen_s(&f, path.c_str(), "r") != 0 || !f) { Log("no WARVR.ini (using default hotkeys)\n"); return; }
@@ -3186,12 +3312,17 @@ static void LoadHotkeyConfig()
         char* eq = strchr(line, '=');
         if (!eq) continue;
         *eq = 0; char* val = eq + 1;
+        if (_stricmp(line, "hud_piece") == 0) {              // a comma list: spaces allowed, a ';' starts a comment
+            char buf[256]; size_t w = 0;
+            for (const char* p = val; *p && *p != ';' && w + 1 < sizeof(buf); ++p) if (*p != ' ' && *p != '\t' && *p != '\r' && *p != '\n') buf[w++] = *p;
+            buf[w] = 0; ParseHudPiece(buf); continue;
+        }
         for (char* p = val; *p; ++p) if (*p == '\r' || *p == '\n' || *p == ' ') *p = 0;
         if (_stricmp(line, "units_per_meter") == 0) { float v = (float)atof(val); if (v > 0.1f) { g_unitsPerMeter = v; Log("WARVR.ini: units_per_meter -> %.2f\n", v); } continue; }
         if (_stricmp(line, "eye_size") == 0) { g_eyeSizeCfg = (UINT)atoi(val); Log("WARVR.ini: eye_size -> %u\n", g_eyeSizeCfg); continue; }
         if (_stricmp(line, "positional") == 0) { g_positional = atoi(val) != 0; Log("WARVR.ini: positional -> %d\n", g_positional ? 1 : 0); continue; }
         if (_stricmp(line, "gpu_path") == 0) { g_gpuPathWanted = _stricmp(val, "off") != 0; Log("WARVR.ini: gpu_path -> %s\n", g_gpuPathWanted ? "auto" : "off"); continue; }
-        if (_stricmp(line, "vr_snapshot_hud_cycle") == 0) { g_snapshotHudCycle = (_stricmp(val, "on") == 0); continue; }
+        if (_stricmp(line, "vr_snapshot_hud_cycle") == 0) { g_snapshotHudCycle = (_stricmp(val, "on") == 0); g_snapshotSplitCycle = (_stricmp(val, "split") == 0); continue; }
         if (_stricmp(line, "vr_snapshot") == 0) { g_snapshotAt = (unsigned)atoi(val); const char* k = strchr(val, ','); g_snapshotCount = k ? (unsigned)atoi(k + 1) : 1; if (g_snapshotCount < 1) g_snapshotCount = 1; Log("WARVR.ini: vr_snapshot -> %u\n", g_snapshotAt); continue; }
         if (_stricmp(line, "auto_vr") == 0) { g_autoVr = _stricmp(val, "on") == 0 || _stricmp(val, "1") == 0; Log("WARVR.ini: auto_vr -> %s\n", g_autoVr ? "on" : "off"); continue; }
         if (_stricmp(line, "lazy_state") == 0) { g_lazyState = _stricmp(val, "on") == 0 || _stricmp(val, "1") == 0; Log("WARVR.ini: lazy_state -> %s\n", g_lazyState ? "on (experimental)" : "off"); continue; }
@@ -3225,6 +3356,7 @@ static void LoadHotkeyConfig()
             continue; }
         if (_stricmp(line, "hud_curve") == 0) { g_hudCurve = !(_stricmp(val, "off") == 0 || _stricmp(val, "0") == 0); g_hudStyle = 3; Log("WARVR.ini: hud_curve -> %s\n", g_hudCurve ? "on" : "off"); continue; }
         if (_stricmp(line, "hud_tilt") == 0) { float v = (float)atof(val); if (v >= -60.f && v <= 60.f) g_hudTilt = v; g_hudStyle = 3; Log("WARVR.ini: hud_tilt -> %.1f deg\n", g_hudTilt); continue; }
+        if (_stricmp(line, "hud_split") == 0) { g_hudSplit = (_stricmp(val, "on") == 0 || _stricmp(val, "1") == 0); Log("WARVR.ini: hud_split -> %s\n", g_hudSplit ? "on" : "off"); continue; }
         if (_stricmp(line, "hud_follow") == 0) { g_hudFollow = (_stricmp(val, "lazy") == 0 || _stricmp(val, "on") == 0); Log("WARVR.ini: hud_follow -> %s\n", g_hudFollow ? "lazy" : "off"); continue; }
         if (_stricmp(line, "hud_follow_deg") == 0) { float v = (float)atof(val); if (v >= 5.f && v <= 170.f) g_hudFollowDeg = v; Log("WARVR.ini: hud_follow_deg -> %.0f\n", g_hudFollowDeg); continue; }
         if (_stricmp(line, "steer") == 0) {
@@ -3310,6 +3442,10 @@ static void RunAction(Action a, const char* via)
         BeepAsync(a == ACT_HUD_NEAR ? 900 : 600, 60);
         Log("HUD distance = %.2f m (width %.2f m)\n", g_hudDistance, g_hudWidth);
         break;
+    case ACT_HUD_SPLIT: {
+        g_hudSplit = !g_hudSplit; BeepAsync(g_hudSplit ? 1400 : 500, 120);
+        Log("split HUD = %d (%d pieces)\n", g_hudSplit ? 1 : 0, g_hudPieceCount);
+        break; }
     case ACT_LASER: {
         g_laserOn = !g_laserOn; BeepAsync(g_laserOn ? 1400 : 500, 120);
         Log("laser pointer = %d\n", g_laserOn ? 1 : 0);

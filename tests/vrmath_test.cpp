@@ -767,6 +767,36 @@ int main() {
         const int s3[6] = { -1, 0, 1, -1, 0, 0 }; CHECK(std::fabs(laserHitDistance(s3, d, 6) - 8.f) < 1e-4f);   // hidden before any visible probe is ignored; first hidden after a visible one counts
         const int s4[6] = { 0, 0, 0, 0, 0, 0 };   CHECK(laserHitDistance(s4, d, 6) < 0.f);
     }
+    {   // split HUD: pieces face you at their heading; the board cells cover exactly what the pieces leave
+        printf("\n[split HUD]\n");
+        const HudPiece pc{ 0.8f, 0.0f, 1.0f, 0.3f, 30.f, -10.f, 1.2f, 0.4f };
+        const V3 c = hudPiecePoint(pc, 0.5f, 0.5f, 16.f / 9.f, 0.f);
+        CHECK(std::fabs(std::sqrt(c.x * c.x + c.y * c.y + c.z * c.z) - 1.2f) < 1e-4f);
+        CHECK(std::fabs(std::atan2(c.x, c.z) * 57.29578f - 30.f) < 1e-3f && c.y < 0.f);
+        const V3 l = hudPiecePoint(pc, 0.f, 0.5f, 16.f / 9.f, 0.f), r = hudPiecePoint(pc, 1.f, 0.5f, 16.f / 9.f, 0.f);
+        const V3 tp = hudPiecePoint(pc, 0.5f, 0.f, 16.f / 9.f, 0.f), bt = hudPiecePoint(pc, 0.5f, 1.f, 16.f / 9.f, 0.f);
+        const float wM = std::sqrt((r.x - l.x) * (r.x - l.x) + (r.y - l.y) * (r.y - l.y) + (r.z - l.z) * (r.z - l.z));
+        const float hM = std::sqrt((tp.x - bt.x) * (tp.x - bt.x) + (tp.y - bt.y) * (tp.y - bt.y) + (tp.z - bt.z) * (tp.z - bt.z));
+        CHECK(std::fabs(wM - 0.4f) < 1e-4f);
+        CHECK(std::fabs(wM / hM - (0.2f * 16.f / 9.f) / 0.3f) < 1e-3f);          // keeps the piece's proportions
+        const float ax = r.x - l.x, ay = r.y - l.y, az = r.z - l.z, bx = tp.x - bt.x, by = tp.y - bt.y, bz = tp.z - bt.z;
+        CHECK(std::fabs(ax * c.x + ay * c.y + az * c.z) < 1e-4f && std::fabs(bx * c.x + by * c.y + bz * c.z) < 1e-4f);   // faces the eye
+        CHECK(tp.y > bt.y);
+        const V3 cy = hudPiecePoint(pc, 0.5f, 0.5f, 16.f / 9.f, 0.3f);
+        CHECK(std::fabs(std::atan2(cy.x, cy.z) - (30.f / 57.29578f + 0.3f)) < 1e-4f);
+        float cells[64][4];
+        CHECK(hudBoardCells(nullptr, 0, cells, 64) == 1 && cells[0][0] == 0.f && cells[0][3] == 1.f);
+        const HudPiece ps[2] = { { 0.8f, 0.0f, 1.0f, 0.3f, 0, 0, 1, 1 }, { 0.3f, 0.4f, 0.5f, 0.6f, 0, 0, 1, 1 } };
+        const int nc = hudBoardCells(ps, 2, cells, 64);
+        float area = 0.f; bool overlap = false;
+        for (int i = 0; i < nc; ++i) {
+            area += (cells[i][2] - cells[i][0]) * (cells[i][3] - cells[i][1]);
+            for (const HudPiece& q : ps)
+                if (cells[i][0] < q.u1 - 1e-6f && cells[i][2] > q.u0 + 1e-6f && cells[i][1] < q.v1 - 1e-6f && cells[i][3] > q.v0 + 1e-6f) overlap = true;
+        }
+        printf("board cells: %d, area %.4f (expected %.4f)\n", nc, area, 1.f - 0.06f - 0.04f);
+        CHECK(!overlap && std::fabs(area - 0.90f) < 1e-4f && nc <= 12);
+    }
     printf(fails ? "\n%d FAILURES\n" : "\nALL TESTS PASSED\n", fails);
     return fails ? 1 : 0;
 }

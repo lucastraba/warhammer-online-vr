@@ -787,6 +787,49 @@ inline V3 hudPanelPoint(float u, float v, float distance, float widthM, float ui
     const float cy = std::cos(yaw), sy = std::sin(yaw);
     return { x * cy + z * sy, vertM + dy, -x * sy + z * cy };
 }
+// ---- split HUD -----------------------------------------------------------------------------------------------
+// A piece of the UI picture (u0..u1, v0..v1 as fractions of it) cut out of the board and shown on its own small panel that
+// faces you: centred yawDeg to the right and pitchDeg up from straight ahead, `distance` metres away and widthM wide (its
+// height follows the piece's own proportions). panelYaw is the board's lazy-follow heading, so the pieces travel with it.
+struct HudPiece { float u0, v0, u1, v1, yawDeg, pitchDeg, distance, widthM; };
+inline V3 hudPiecePoint(const HudPiece& p, float s, float t, float uiAspect, float panelYaw) {
+    const float pw = (p.u1 - p.u0) * uiAspect, ph = p.v1 - p.v0;
+    const float hw = p.widthM * 0.5f, hh = ph > 1e-5f && pw > 1e-5f ? hw * ph / pw : hw;
+    const float lx = (s - 0.5f) * 2.f * hw, ly = (0.5f - t) * 2.f * hh, lz = p.distance;
+    const float pt = p.pitchDeg * 3.14159265f / 180.f, yw = p.yawDeg * 3.14159265f / 180.f + panelYaw;
+    const float y1 = ly * std::cos(pt) + lz * std::sin(pt), z1 = -ly * std::sin(pt) + lz * std::cos(pt);
+    const float cy = std::cos(yw), sy = std::sin(yw);
+    return { lx * cy + z1 * sy, y1, -lx * sy + z1 * cy };
+}
+// What is left of the board once the pieces are cut out, as rectangles (u0, v0, u1, v1): the grid made by every piece
+// edge, with each row's cells that lie outside all pieces merged into runs. Returns how many were written (at most maxOut).
+inline int hudBoardCells(const HudPiece* p, int n, float (*out)[4], int maxOut) {
+    float us[66], vs[66]; int nu = 0, nv = 0;
+    auto cl = [](float x) { return x < 0.f ? 0.f : (x > 1.f ? 1.f : x); };
+    us[nu++] = 0.f; us[nu++] = 1.f; vs[nv++] = 0.f; vs[nv++] = 1.f;
+    for (int i = 0; i < n && i < 32; ++i) { us[nu++] = cl(p[i].u0); us[nu++] = cl(p[i].u1); vs[nv++] = cl(p[i].v0); vs[nv++] = cl(p[i].v1); }
+    auto uniq = [](float* a, int k) { std::sort(a, a + k); int w = 0; for (int i = 0; i < k; ++i) if (!w || a[i] - a[w - 1] > 1e-6f) a[w++] = a[i]; return w; };
+    nu = uniq(us, nu); nv = uniq(vs, nv);
+    int m = 0;
+    for (int j = 0; j + 1 < nv; ++j) {
+        const float cv = 0.5f * (vs[j] + vs[j + 1]);
+        int runStart = -1;
+        for (int i = 0; i + 1 <= nu; ++i) {
+            bool free = false;
+            if (i + 1 < nu) {
+                const float cu = 0.5f * (us[i] + us[i + 1]);
+                free = true;
+                for (int k = 0; k < n; ++k) if (cu > p[k].u0 && cu < p[k].u1 && cv > p[k].v0 && cv < p[k].v1) { free = false; break; }
+            }
+            if (free && runStart < 0) runStart = i;
+            if (!free && runStart >= 0) {
+                if (m < maxOut) { out[m][0] = us[runStart]; out[m][1] = vs[j]; out[m][2] = us[i]; out[m][3] = vs[j + 1]; ++m; }
+                runStart = -1;
+            }
+        }
+    }
+    return m;
+}
 // The same transform hudQuadEyeSpace applies to its corners: game frame -> this eye's space.
 inline void hudPointToEye(const V3& pt, const V3& eyeOff, const Mat3& q, const V3& headPos, float out[3]) {
     const float rel[3] = { pt.x - headPos.x, pt.y - headPos.y, pt.z - headPos.z };
