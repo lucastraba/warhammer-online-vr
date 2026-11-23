@@ -1,7 +1,7 @@
 # WARVR build. WAR.exe is a 32-bit process, so the DLL and the injector must be 32-bit (Win32).
 #
 #   Visual Studio:  double-click build.bat   (or: cmake -S . -B build -A Win32 && cmake --build build --config Release)
-#   Output:         build\Release\WARVR.dll, build\Release\WARVRInjector.exe
+#   Output:         build\Release\WARVR.dll, build\Release\WARVRInjector.exe, build\Release\WARVRConfig.exe
 #   Unit tests:     ctest --test-dir build -C Release
 cmake_minimum_required(VERSION 3.20)
 project(WARVR LANGUAGES CXX)
@@ -34,6 +34,10 @@ if(WIN32)
     target_compile_definitions(WARVRInjector PRIVATE _MBCS)
   endif()
 
+  # The settings window (WARVR.ini, dxvk.conf, the private server's time of day).
+  add_executable(WARVRConfig WIN32 src/config.cpp)
+  target_link_libraries(WARVRConfig PRIVATE user32 gdi32 comctl32 shell32 ole32 advapi32)
+
   # Put the 32-bit openvr_api.dll next to the build output, so the output folder is the complete install set.
   add_custom_command(TARGET WARVR POST_BUILD
     COMMAND ${CMAKE_COMMAND} -E copy_if_different
@@ -42,7 +46,7 @@ endif()
 
 # Pure-math unit tests: build and run on any platform.
 enable_testing()
-foreach(t vrmath_test shaderscan_test hookutil_test)
+foreach(t vrmath_test shaderscan_test hookutil_test settings_test)
   add_executable(${t} tests/${t}.cpp)
   add_test(NAME ${t} COMMAND ${t})
 endforeach()

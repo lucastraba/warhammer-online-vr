@@ -29,6 +29,8 @@ Nothing else changes; `vk_path=auto` is the default. `vk_path=off` in WARVR.ini 
 
 ## Texture filtering
 
+WARVRConfig.exe can set this for you ("Texture filtering (DXVK)"), and the log switch below too.
+
 dgVoodoo can force anisotropic filtering; DXVK doesn't by default, so distant textures can look softer. To force it, create
 a text file `dxvk.conf` next to `WAR.exe` (where DXVK's `d3d9.dll` is) containing:
 

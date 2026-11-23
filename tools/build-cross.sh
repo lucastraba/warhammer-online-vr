@@ -12,7 +12,7 @@ elif command -v uvx >/dev/null 2>&1; then ZIG=(uvx --from ziglang python -m zigl
 else echo "need zig (or uv: https://docs.astral.sh/uv/)" >&2; exit 1; fi
 
 CXX="${CXX:-c++}"
-for t in vrmath_test shaderscan_test hookutil_test; do
+for t in vrmath_test shaderscan_test hookutil_test settings_test; do
   "$CXX" -std=c++17 -O1 -o "$out/$t" "tests/$t.cpp"
   "$out/$t" > "$out/$t.log" || { cat "$out/$t.log"; echo "$t FAILED" >&2; exit 1; }
   tail -n 1 "$out/$t.log"
@@ -21,6 +21,8 @@ done
 WIN=(-target x86-windows-gnu -std=c++17 -O2 -DNDEBUG)
 "${ZIG[@]}" c++ "${WIN[@]}" -shared -o "$out/WARVR.dll" src/WARVR.cpp -luser32
 "${ZIG[@]}" c++ "${WIN[@]}" -o "$out/WARVRInjector.exe" src/injector.cpp
+"${ZIG[@]}" c++ "${WIN[@]}" -Wl,--subsystem,windows -o "$out/WARVRConfig.exe" src/config.cpp \
+  -luser32 -lgdi32 -lcomctl32 -lshell32 -lole32 -ladvapi32
 cp third_party/openvr/bin/win32/openvr_api.dll "$out/"
 rm -f "$out"/*.pdb "$out"/*.lib
-echo "built: $out/WARVR.dll $out/WARVRInjector.exe $out/openvr_api.dll"
+echo "built: $out/WARVR.dll $out/WARVRInjector.exe $out/WARVRConfig.exe $out/openvr_api.dll"

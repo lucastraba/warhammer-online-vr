@@ -1,0 +1,30 @@
+diff --git a/WorldServer/Configs/WorldConfigs.cs b/WorldServer/Configs/WorldConfigs.cs
+index 8270b5d4..6d6abf0a 100644
+--- a/WorldServer/Configs/WorldConfigs.cs
++++ b/WorldServer/Configs/WorldConfigs.cs
+@@ -13,6 +13,12 @@ namespace WorldServer.Configs
+ 
+         public byte RealmId = 1;
+ 
++        /// <summary>
++        /// Shifts the in-game time of day by this many hours. 0 = the server clock (UTC). 12 swaps day and night.
++        /// Applies when a character enters the world or changes zone.
++        /// </summary>
++        public double TimeOfDayOffsetHours = 0;
++
+         // Level / Looting
+         public int GlobalLootRate = 1;
+         public int CommonLootRate = 1;
+diff --git a/WorldServer/NetWork/Handler/MovementHandlers.cs b/WorldServer/NetWork/Handler/MovementHandlers.cs
+index 77e840da..d81e67f6 100644
+--- a/WorldServer/NetWork/Handler/MovementHandlers.cs
++++ b/WorldServer/NetWork/Handler/MovementHandlers.cs
+@@ -934,7 +934,7 @@ namespace WorldServer.NetWork.Handler
+                 return;
+ 
+             PacketOut Out = new PacketOut((byte)Opcodes.F_SET_TIME, 8);
+-            Out.WriteUInt16((ushort)(DateTime.UtcNow.TimeOfDay.TotalSeconds / 65.5d));
++            Out.WriteUInt16((ushort)(DateTime.UtcNow.AddHours(Program.Config.TimeOfDayOffsetHours).TimeOfDay.TotalSeconds / 65.5d));
+             Out.WriteUInt16(0);
+             Out.WriteUInt32(1); // Game seconds passing per second.
+             cclient.Plr.SendPacket(Out);
